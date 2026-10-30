@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/francisconeves97/jxscout/internal/core/common"
 	"github.com/francisconeves97/jxscout/internal/modules/overrides"
 	"github.com/francisconeves97/jxscout/pkg/constants"
 	jxscouttypes "github.com/francisconeves97/jxscout/pkg/types"
@@ -320,23 +321,11 @@ func (t *TUI) View() string {
 		return t.renderLogsPanel()
 	}
 
+	options := t.jxscout.GetOptions()
+	s.WriteString(fmt.Sprintf("JXScout  |  project: %s  |  capture: %s:%d\n", options.ProjectName, options.Hostname, options.Port))
+	s.WriteString(fmt.Sprintf("Output: %s\n", common.GetWorkingDirectory(options.ProjectName)))
 	if t.output == "" {
-		s.WriteString(staticBanner)
-
-		disclaimer := "This version of JXScout is no longer actively maintained.\n\nJXScout has evolved a lot since this open source version was first released. The project has been completely rewritten from scratch in Rust as JXScout Pro, which is a separate, closed source codebase. JXScout Pro is a completely different product — it doesn't share any code with this version and is far more capable.\n\nYou're welcome to experiment with this version, but be aware it has known bugs that will impact your coverage. For the full experience, check out JXScout Pro.\n\nI am always happy to offer free trials for the Pro version! You can get it through https://jxscout.app/"
-		if t.width > 0 {
-			disclaimer = wordwrap.String(disclaimer, t.width)
-		}
-		s.WriteString(lipgloss.NewStyle().
-			Foreground(lipgloss.Color("205")).
-			Render("\n" + disclaimer + "\n"))
-
-		if t.hasUpdate {
-			updateMsg := fmt.Sprintf("\n🔄 A new version (%s) is available!\nVisit https://github.com/francisconeves97/jxscout to check it out.\n", t.latestVersion)
-			s.WriteString(lipgloss.NewStyle().
-				Foreground(lipgloss.Color("205")).
-				Render(updateMsg))
-		}
+		s.WriteString("\nassets · loads · loaded · config · logs · help\nUse jxscout scan --help for standalone analysis.\n")
 	}
 
 	// Render output

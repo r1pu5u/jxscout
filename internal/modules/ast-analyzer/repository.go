@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/francisconeves97/jxscout/internal/core/common"
@@ -18,6 +19,7 @@ const (
 )
 
 type astAnalysis struct {
+	InputHash       string     `db:"input_hash"`
 	ID              int64      `db:"id"`
 	AssetType       string     `db:"asset_type"`
 	AssetID         int64      `db:"asset_id"`
@@ -59,6 +61,9 @@ func newAstAnalyzerRepository(db *sqlx.DB) (*astAnalyzerRepository, error) {
 		return nil, err
 	}
 
+	if _, err := db.Exec("ALTER TABLE ast_analysis_results ADD COLUMN input_hash TEXT NOT NULL DEFAULT ''"); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+		return nil, err
+	}
 	return repo, nil
 }
 
@@ -88,14 +93,15 @@ func (r *astAnalyzerRepository) initializeTable() error {
 
 func (r *astAnalyzerRepository) createAnalysis(ctx context.Context, analysis astAnalysis) error {
 	query := `
-		INSERT INTO ast_analysis_results (asset_id, asset_type, asset_path, analyzer_version, results)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO ast_analysis_results (asset_id, asset_type, asset_path, analyzer_version, results,input_hash)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(asset_id, asset_type) DO UPDATE SET
 			analyzer_version = excluded.analyzer_version,
+			input_hash = excluded.input_hash,
 			results = excluded.results,
 			updated_at = CURRENT_TIMESTAMP	
 	`
-	_, err := r.db.ExecContext(ctx, query, analysis.AssetID, analysis.AssetType, analysis.AssetPath, analysis.AnalyzerVersion, analysis.Results)
+	_, err := r.db.ExecContext(ctx, query, analysis.AssetID, analysis.AssetType, analysis.AssetPath, analysis.AnalyzerVersion, analysis.Results, analysis.InputHash)
 	if err != nil {
 		return errutil.Wrap(err, "failed to create ast analysis")
 	}

@@ -2,6 +2,8 @@ package assetservice
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
@@ -89,6 +91,11 @@ func (s *fileServiceImpl) urlToPath(pathURL string, filePath []string) (string, 
 	filePath = append(filePath, pathParts...)
 
 	targetPath := filepath.Join(filePath...)
+	if parsedURL.RawQuery != "" {
+		ext := filepath.Ext(targetPath)
+		hash := sha256.Sum256([]byte(parsedURL.RawQuery))
+		targetPath = strings.TrimSuffix(targetPath, ext) + fmt.Sprintf(".%x", hash[:8]) + ext
+	}
 
 	if runtime.GOOS == "windows" {
 		base := filepath.Base(targetPath)

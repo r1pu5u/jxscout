@@ -34,10 +34,6 @@ func NormalizeURL(rawURL string) string {
 
 	parsedURL.Fragment = ""
 	parsedURL.RawFragment = ""
-	parsedURL.RawQuery = ""
-	parsedURL.ForceQuery = false
-
-	parsedURL.Path = strings.TrimSuffix(parsedURL.Path, "/")
 
 	return parsedURL.String()
 }
@@ -123,15 +119,27 @@ func GetHome() string {
 }
 
 func GetWorkingDirectory(projectName string) string {
+	if root := os.Getenv("JXSCOUT_DATA_DIR"); root != "" {
+		return filepath.Join(root, projectName)
+	}
+	if root := os.Getenv("JXSCOUT_PROJECT_ROOT"); root != "" {
+		return root
+	}
 	return filepath.Join(GetHome(), "jxscout", projectName)
 }
 
 func GetPrivateDirectoryRoot() string {
+	if root := os.Getenv("JXSCOUT_DATA_DIR"); root != "" {
+		return filepath.Join(root, ".state")
+	}
+	if root := os.Getenv("JXSCOUT_PROJECT_ROOT"); root != "" {
+		return filepath.Join(root, ".state")
+	}
 	return filepath.Join(GetHome(), ".jxscout")
 }
 
 func GetPrivateDirectory(projectName string) string {
-	return filepath.Join(GetHome(), ".jxscout", projectName)
+	return filepath.Join(GetPrivateDirectoryRoot(), projectName)
 }
 
 func FileExists(filePath string) (bool, error) {

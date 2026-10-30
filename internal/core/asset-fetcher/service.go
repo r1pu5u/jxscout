@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -22,11 +23,13 @@ type AssetFetcher interface {
 }
 
 type assetFetcherImpl struct {
+	allowedURL  func(string) bool
 	client      *http.Client
 	rateLimiter ratelimit.Limiter
 }
 
 type AssetFetcherOptions struct {
+	AllowedURL                       func(string) bool
 	RateLimitingMaxRequestsPerMinute int
 	RateLimitingMaxRequestsPerSecond int
 }
@@ -36,6 +39,20 @@ func NewAssetFetcher(options AssetFetcherOptions) *assetFetcherImpl {
 	tlsConfig := http.DefaultTransport.(*http.Transport).TLSClientConfig
 
 	c := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 6 {
+				return fmt.Errorf("too many redirects")
+			}
+			if options.AllowedURL != nil && !options.AllowedURL(req.URL.String()) {
+				return fmt.Errorf("redirect outside configured scope")
+			}
+			if len(via) > 0 && (via[0].URL.Scheme != req.URL.Scheme || via[0].URL.Host != req.URL.Host) {
+				req.Header = make(http.Header)
+				req.Header.Set("Accept", "*/*")
+			}
+			return nil
+		},
 		Transport: &http.Transport{
 			TLSHandshakeTimeout: 30 * time.Second,
 			DisableKeepAlives:   false,
@@ -69,6 +86,7 @@ func NewAssetFetcher(options AssetFetcherOptions) *assetFetcherImpl {
 
 	return &assetFetcherImpl{
 		client:      c,
+		allowedURL:  options.AllowedURL,
 		rateLimiter: rateLimiter,
 	}
 }
@@ -81,6 +99,9 @@ func (s *assetFetcherImpl) RateLimitedGet(ctx context.Context, url string, heade
 
 // Get is a regular HTTP get but handles GZIP and adds headers to avoid being detected as bot.
 func (s *assetFetcherImpl) Get(ctx context.Context, url string, headers map[string]string) (string, bool, error) {
+	if s.allowedURL != nil && !s.allowedURL(url) {
+		return "", false, fmt.Errorf("URL outside configured scope")
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return "", false, errutil.Wrap(err, "failed to create request")

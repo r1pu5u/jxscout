@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/url"
 	"os"
 	"regexp"
@@ -78,7 +77,12 @@ func getSourceMapForAsset(ctx context.Context, asset assetservice.Asset, sdk *jx
 		{
 			name: "url_dot_map",
 			getter: func(ctx context.Context, asset assetservice.Asset, sdk *jxscouttypes.ModuleSDK) (string, error) {
-				return fmt.Sprintf("%s.map", asset.URL), nil
+				parsed, err := url.Parse(asset.URL)
+				if err != nil {
+					return "", err
+				}
+				parsed.Path += ".map"
+				return parsed.String(), nil
 			},
 		},
 		{
@@ -146,7 +150,14 @@ func getSourceMapForAsset(ctx context.Context, asset assetservice.Asset, sdk *jx
 			return sm, true, nil
 		}
 
-		res, ok, err := sdk.AssetFetcher.RateLimitedGet(ctx, sourceMapParsedURL.String(), nil)
+		headers := asset.RequestHeaders
+		if sourceMapParsedURL.Host != jsURL.Host || sourceMapParsedURL.Scheme != jsURL.Scheme {
+			headers = nil
+		}
+		if !sdk.Scope.IsInScope(sourceMapParsedURL.String()) {
+			continue
+		}
+		res, ok, err := sdk.AssetFetcher.RateLimitedGet(ctx, sourceMapParsedURL.String(), headers)
 		if err != nil {
 			return sourceMap{}, false, dbeventbus.NewRetriableError(errutil.Wrap(err, "failed to fetch source map"))
 		}

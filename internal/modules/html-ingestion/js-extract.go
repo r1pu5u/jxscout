@@ -4,13 +4,13 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/francisconeves97/jxscout/internal/core/common"
 	"github.com/francisconeves97/jxscout/internal/core/errutil"
 
 	"github.com/PuerkitoBio/goquery"
 )
 
 type extractedJS struct {
+	baseURL       string
 	scriptURLs    []string // script URLs
 	inlineScripts []string // actual scripts that were inlined
 }
@@ -26,63 +26,50 @@ func extractJS(htmlContent string, baseURLRaw string) (extractedJS, error) {
 		return extractedJS{}, errutil.Wrap(err, "failed to parse url")
 	}
 
+	inlineBase := baseURL
+	if href, ok := doc.Find("base[href]").First().Attr("href"); ok {
+		if ref, err := url.Parse(href); err == nil {
+			inlineBase = baseURL.ResolveReference(ref)
+		}
+	}
 	scriptURLs := extractJavascriptURLs(doc, baseURL)
 	inlineScripts := extractInlineJavascript(doc)
 
 	return extractedJS{
+		baseURL:       inlineBase.String(),
 		scriptURLs:    scriptURLs,
 		inlineScripts: inlineScripts,
 	}, nil
 }
 
 func extractJavascriptURLs(doc *goquery.Document, baseURL *url.URL) []string {
+	if href, ok := doc.Find("base[href]").First().Attr("href"); ok {
+		if ref, err := url.Parse(href); err == nil {
+			baseURL = baseURL.ResolveReference(ref)
+		}
+	}
 	urls := []string{}
-
-	basePath := ""
-
-	// base will replace the base href of the page. this is hacky but might work in most cases?
-	doc.Find("base").Each(func(i int, s *goquery.Selection) {
-		href, exists := s.Attr("href")
-		if !exists {
+	seen := map[string]bool{}
+	doc.Find(`script[src],link[rel="modulepreload"],link[rel="preload"][as="script"]`).Each(func(_ int, selection *goquery.Selection) {
+		src, ok := selection.Attr("src")
+		if !ok {
+			src, _ = selection.Attr("href")
+		}
+		ref, err := url.Parse(src)
+		if err != nil {
 			return
 		}
-
-		basePath = href
-	})
-
-	doc.Find("script").Each(func(i int, selection *goquery.Selection) {
-		src, exists := selection.Attr("src")
-		if !exists {
+		resolved := baseURL.ResolveReference(ref)
+		if resolved.Scheme != "http" && resolved.Scheme != "https" {
 			return
 		}
-
-		if common.IsRelativePath(src) {
-			path, err := url.JoinPath(basePath, src)
-			if err != nil {
-				return // TODO: improve error observability
-			}
-
-			url := &url.URL{
-				Scheme: baseURL.Scheme,
-				Host:   baseURL.Hostname(),
-				Path:   path,
-			}
-
-			urls = append(urls, url.String())
-		} else {
-			parsedURl, err := url.Parse(src)
-			if err != nil {
-				return // TODO: improve error observability
-			}
-
-			if parsedURl.Scheme == "" {
-				parsedURl.Scheme = "https"
-			}
-
-			urls = append(urls, parsedURl.String())
+		resolved.Fragment = ""
+		value := resolved.String()
+		if !seen[value] {
+			seen[value] = true
+			urls = append(urls, value)
 		}
 	})
-
 	return urls
 }
 

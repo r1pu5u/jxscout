@@ -13,7 +13,7 @@ export function createBaseTest(
   testType: string,
   testCase: BaseTestCase,
   analyzerType: AnalyzerType,
-  number: number
+  number: number,
 ) {
   it(`${testType} ${number} - $jsFileName`, () => {
     const { jsFileName, expectedResults } = testCase;
@@ -22,23 +22,23 @@ export function createBaseTest(
 
     // Sort both arrays by value to ensure consistent comparison
     const sortedResults = results.sort((a, b) =>
-      a.value.localeCompare(b.value)
+      a.value.localeCompare(b.value),
     );
-    const sortedExpected = expectedResults.sort((a, b) =>
-      a.value.localeCompare(b.value)
-    );
+    const sortedExpected = expectedResults
+      .map((r) => ({ ...r, filePath }))
+      .sort((a, b) => a.value.localeCompare(b.value));
 
     const expectedPath = path.join(
       __dirname,
       testType,
-      `expected${number}.json`
+      `expected${number}.json`,
     );
 
     if (!fs.existsSync(expectedPath)) {
       const outputPath = path.join(
         __dirname,
         testType,
-        `expected${number}.json`
+        `expected${number}.json`,
       );
       fs.writeFileSync(outputPath, JSON.stringify(sortedResults, null, 2));
     }
@@ -49,7 +49,7 @@ export function createBaseTest(
 
 export function loadExpectedResults(
   testType: string,
-  number: number = 1
+  number: number = 1,
 ): AnalyzerMatch[] {
   const expectedPath = path.join(__dirname, testType, `expected${number}.json`);
 
@@ -64,7 +64,7 @@ export function loadExpectedResults(
 
     if (!Array.isArray(parsed)) {
       console.warn(
-        `Expected results file ${expectedPath} does not contain an array`
+        `Expected results file ${expectedPath} does not contain an array`,
       );
       return [];
     }

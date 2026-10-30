@@ -1,8 +1,11 @@
 package main
 
 import (
+	agentcli "github.com/francisconeves97/jxscout/pkg/agent-cli"
 	"log"
+	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/francisconeves97/jxscout/internal/core/common"
 	"github.com/francisconeves97/jxscout/pkg/constants"
@@ -15,6 +18,36 @@ import (
 const Version = constants.Version
 
 func main() {
+	workspaceRoot, workspaceConfig, hasWorkspace, workspaceErr := common.DiscoverWorkspace("")
+	if workspaceErr != nil {
+		log.Fatalf("failed to detect workspace: %s", workspaceErr)
+	}
+	if hasWorkspace && os.Getenv("JXSCOUT_DATA_DIR") == "" {
+		if err := os.Setenv("JXSCOUT_PROJECT_ROOT", workspaceRoot); err != nil {
+			log.Fatalf("failed to set workspace root: %s", err)
+		}
+	}
+	if len(os.Args) == 1 || os.Args[1] == "--help" || os.Args[1] == "-h" {
+		os.Exit(agentcli.Run(nil))
+	}
+	serverMode := os.Args[1] == "serve" || os.Args[1] == "tui"
+	switch os.Args[1] {
+	case "tui":
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	case "serve":
+		os.Setenv("JXSCOUT_HEADLESS", "true")
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	default:
+		if os.Args[1][0] != '-' {
+			os.Exit(agentcli.Run(os.Args[1:]))
+		}
+	}
+	if serverMode {
+		os.Args = rewriteProjectAlias(os.Args)
+	}
+	projectFlagSet := hasOption(os.Args[1:], "project-name", "project")
+	scopeFlagSet := hasOption(os.Args[1:], "scope")
+
 	options := jxscouttypes.Options{}
 
 	flagSet := goflags.NewFlagSet()
@@ -39,6 +72,8 @@ func main() {
 		flagSet.IntVar(&options.ChunkDiscovererConcurrency, constants.FlagChunkDiscovererConcurrency, constants.DefaultChunkDiscovererConcurrency, constants.DescriptionChunkDiscovererConcurrency),
 		flagSet.IntVar(&options.ASTAnalyzerConcurrency, constants.FlagASTAnalyzerConcurrency, constants.DefaultASTAnalyzerConcurrency, constants.DescriptionASTAnalyzerConcurrency),
 	)
+
+	flagSet.StringVar(&options.WebcrackMode, "webcrack", "auto", "webcrack mode: auto, off, required")
 
 	flagSet.CreateGroup("chunk discovery", "chunk discovery configuration",
 		flagSet.IntVar(&options.ChunkDiscovererBruteForceLimit, constants.FlagChunkDiscovererBruteForceLimit, constants.DefaultChunkDiscovererBruteForceLimit, constants.DescriptionChunkDiscovererBruteForceLimit),
@@ -69,12 +104,17 @@ func main() {
 		flagSet.DurationVar(&options.OverrideContentCheckInterval, constants.FlagOverrideContentCheckInterval, constants.DefaultOverrideContentCheckInterval, constants.DescriptionOverrideContentCheckInterval),
 	)
 
-	if options.ProjectName == constants.DefaultProjectName {
+	if hasWorkspace && !projectFlagSet {
+		options.ProjectName = workspaceConfig.Project
+	} else if options.ProjectName == constants.DefaultProjectName && !projectFlagSet {
 		projectName, err := common.GetProjectName()
 		if err != nil {
 			log.Fatalf("failed to get project name: %s", err.Error())
 		}
 		options.ProjectName = projectName
+	}
+	if hasWorkspace && !scopeFlagSet {
+		options.ScopePatterns = workspaceConfig.Scope
 	}
 
 	err := jxscout.CheckAndMigrateOldVersion()
@@ -89,6 +129,12 @@ func main() {
 		log.Fatalf("could not parse flags: %s", err.Error())
 	}
 
+	if hasWorkspace && !projectFlagSet {
+		options.ProjectName = workspaceConfig.Project
+	}
+	if hasWorkspace && !scopeFlagSet {
+		options.ScopePatterns = workspaceConfig.Scope
+	}
 	jxscout, err := jxscout.NewJXScout(options)
 	if err != nil {
 		flagSet.CommandLine.PrintDefaults()
@@ -99,4 +145,32 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to start jxscout: %s", err.Error())
 	}
+}
+
+func hasOption(args []string, names ...string) bool {
+	wanted := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		wanted[name] = struct{}{}
+	}
+	for _, arg := range args {
+		name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
+		if _, ok := wanted[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func rewriteProjectAlias(args []string) []string {
+	rewritten := append([]string(nil), args...)
+	for i, arg := range rewritten {
+		if arg == "--project" || arg == "-project" {
+			rewritten[i] = strings.Replace(arg, "project", "project-name", 1)
+			continue
+		}
+		if strings.HasPrefix(arg, "--project=") || strings.HasPrefix(arg, "-project=") {
+			rewritten[i] = strings.Replace(arg, "project=", "project-name=", 1)
+		}
+	}
+	return rewritten
 }

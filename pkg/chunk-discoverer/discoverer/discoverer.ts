@@ -1,3 +1,4 @@
+import { deepDiscover } from "./deep";
 import { Program } from "acorn";
 import { parse } from "acorn-loose";
 import { is, traverse } from "estree-toolkit";
@@ -10,7 +11,7 @@ import { getChunkFunctionCode } from "./transformer";
 
 export const discoverChunks = (
   code: string,
-  bruteforceLimit: number
+  bruteforceLimit: number,
 ): string[] => {
   let sourceType: "module" | "script" = "script";
   let ast: Program;
@@ -28,18 +29,25 @@ export const discoverChunks = (
     });
   }
 
-  const webpackChunks = webpackCunkDiscovery(ast, sourceType, bruteforceLimit);
-  if (webpackChunks.length !== 0) {
-    return webpackChunks;
+  let webpackChunks: string[] = [];
+  try {
+    webpackChunks = webpackCunkDiscovery(ast, sourceType, bruteforceLimit);
+  } catch {
+    /* retain independent strategies */
   }
-
-  return viteChunkDiscovery(ast, sourceType, bruteforceLimit);
+  return [
+    ...new Set([
+      ...webpackChunks,
+      ...viteChunkDiscovery(ast, sourceType, bruteforceLimit),
+      ...deepDiscover(code, [], bruteforceLimit).map((c) => c.specifier),
+    ]),
+  ];
 };
 
 const viteChunkDiscovery = (
   ast: Program,
   sourceType: "module" | "script",
-  bruteforceLimit: number
+  bruteforceLimit: number,
 ): string[] => {
   const chunks = new Set(getViteChunks(ast));
 
@@ -49,7 +57,7 @@ const viteChunkDiscovery = (
 const webpackCunkDiscovery = (
   ast: Program,
   sourceType: "module" | "script",
-  bruteforceLimit: number
+  bruteforceLimit: number,
 ): string[] => {
   const chunkFunctionContext = identifyChunkLoadingFunctionAndExpression(ast);
   if (!chunkFunctionContext) {
@@ -68,7 +76,7 @@ const webpackCunkDiscovery = (
 
   const possibleParams = getChunkFunctionPossibleParams(
     parsedFunction,
-    bruteforceLimit
+    bruteforceLimit,
   );
 
   return getPossibleChunks(chunkFunctionCode, possibleParams);
@@ -76,7 +84,7 @@ const webpackCunkDiscovery = (
 
 const getPossibleChunks = (
   functionCode: string,
-  possibleParams: any[]
+  possibleParams: any[],
 ): string[] => {
   const sval = new Sval({
     ecmaVer: "latest",
@@ -91,7 +99,7 @@ const getPossibleChunks = (
 
   for (let param of possibleParams) {
     if (typeof param === "string") {
-      param = `"${param}"`;
+      param = JSON.stringify(param);
     }
 
     sval.run(`exports.res = (${functionCode})(${param})`);
@@ -108,7 +116,7 @@ const getPossibleChunks = (
 
 const getChunkFunctionPossibleParams = (
   parsedFunction: Program,
-  bruteforceLimit: number
+  bruteforceLimit: number,
 ): any[] => {
   const params: Set<any> = new Set();
   let shouldBruteForce = false;

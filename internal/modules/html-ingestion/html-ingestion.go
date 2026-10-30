@@ -88,6 +88,27 @@ func (m *htmlIngestionModule) handleIngestionRequest(req *ingestion.IngestionReq
 		return errutil.Wrap(err, "failed to extract JS")
 	}
 
+	for _, scriptURL := range extractedJS.scriptURLs {
+		if !m.sdk.Scope.IsInScope(scriptURL) {
+			continue
+		}
+		headers := req.Request.Headers
+		source, _ := url.Parse(req.Request.URL)
+		target, _ := url.Parse(scriptURL)
+		if source.Host != target.Host || source.Scheme != target.Scheme {
+			headers = nil
+		}
+		content, found, err := m.sdk.AssetFetcher.RateLimitedGet(m.sdk.Ctx, scriptURL, headers)
+		if err != nil {
+			m.sdk.Logger.Warn("failed to fetch script reference", "url", scriptURL, "error", err)
+			continue
+		}
+		if !found || common.IsProbablyHTML([]byte(content)) {
+			continue
+		}
+		m.sdk.AssetService.AsyncSaveAsset(m.sdk.Ctx, &assetservice.Asset{URL: scriptURL, Content: &content, ContentType: common.ContentTypeJS, Project: m.sdk.Options.ProjectName, RequestHeaders: headers, Parent: &assetservice.Asset{URL: htmlPath}})
+	}
+
 	for i, content := range extractedJS.inlineScripts {
 		inlinePath, err := url.JoinPath(req.Request.URL, fmt.Sprintf("(index).%d.inline.js", i))
 		if err != nil {
@@ -95,12 +116,13 @@ func (m *htmlIngestionModule) handleIngestionRequest(req *ingestion.IngestionReq
 		}
 
 		m.sdk.AssetService.AsyncSaveAsset(m.sdk.Ctx, &assetservice.Asset{
-			URL:            inlinePath,
-			Content:        &content,
-			ContentType:    common.ContentTypeJS,
-			Project:        m.sdk.Options.ProjectName,
-			RequestHeaders: req.Request.Headers,
-			IsInlineJS:     true,
+			URL:              inlinePath,
+			Content:          &content,
+			ContentType:      common.ContentTypeJS,
+			Project:          m.sdk.Options.ProjectName,
+			RequestHeaders:   req.Request.Headers,
+			IsInlineJS:       true,
+			DiscoveryBaseURL: extractedJS.baseURL,
 			Parent: &assetservice.Asset{
 				URL: htmlPath,
 			},

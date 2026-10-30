@@ -40,6 +40,7 @@ type Scope interface {
 
 // JXScout Options
 type Options struct {
+	WebcrackMode                     string              `yaml:"webcrack"`
 	Port                             int                 `yaml:"port"`
 	Hostname                         string              `yaml:"hostname"`
 	ProjectName                      string              `yaml:"project-name"`

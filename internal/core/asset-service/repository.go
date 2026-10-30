@@ -28,6 +28,7 @@ type GetAssetsParams struct {
 }
 
 type DBAsset struct {
+	DiscoveryBaseURL  string    `db:"discovery_base_url"`
 	ID                int64     `db:"id"`
 	URL               string    `db:"url"`
 	ContentHash       string    `db:"content_hash"`
@@ -85,6 +86,15 @@ func initializeRepo(db *sqlx.DB) error {
 		return errutil.Wrap(err, "failed to create schema")
 	}
 
+	var baseColumn int
+	if err := db.Get(&baseColumn, "SELECT COUNT(*) FROM pragma_table_info('assets') WHERE name='discovery_base_url'"); err != nil {
+		return err
+	}
+	if baseColumn == 0 {
+		if _, err := db.Exec("ALTER TABLE assets ADD COLUMN discovery_base_url TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
 	// Run migrations
 	if err := migrateAddIsInlineJS(db); err != nil {
 		return errutil.Wrap(err, "failed to run migrations")
@@ -221,6 +231,9 @@ func SaveAsset(ctx context.Context, db queryer, asset DBAsset) (int64, error) {
 		return 0, errutil.Wrap(err, "failed to insert the asset")
 	}
 
+	if _, err := db.ExecContext(ctx, "UPDATE assets SET discovery_base_url=? WHERE id=?", asset.DiscoveryBaseURL, assetID); err != nil {
+		return 0, err
+	}
 	// Check if we got a valid ID
 	if assetID == 0 {
 		// Try to get the ID directly to see if the row exists

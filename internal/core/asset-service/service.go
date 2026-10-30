@@ -31,6 +31,7 @@ type AssetService interface {
 }
 
 type Asset struct {
+	DiscoveryBaseURL string `json:"discovery_base_url,omitempty"`
 	// ID is the id of the asset on the database
 	ID int64 `json:"id"`
 	// URL is the url where this asset was found
@@ -204,6 +205,12 @@ func (s *assetService) handleSaveAssetRequest(ctx context.Context, asset *Asset)
 		}
 	}
 
+	// Preserve immutable capture bytes before other modules beautify the working file.
+	if asset.Content != nil {
+		if _, err := s.fileService.SaveInSubfolder(ctx, "raw/"+common.Hash(*asset.Content), SaveFileRequest{PathURL: asset.URL, Content: asset.Content}); err != nil {
+			return err
+		}
+	}
 	path, err := s.fileService.SaveInSubfolder(ctx, assetsFolder, SaveFileRequest{
 		PathURL: asset.URL,
 		Content: asset.Content,
@@ -222,6 +229,7 @@ func (s *assetService) handleSaveAssetRequest(ctx context.Context, asset *Asset)
 	}
 
 	repoAsset := DBAsset{
+		DiscoveryBaseURL:  asset.DiscoveryBaseURL,
 		URL:               asset.URL,
 		ContentHash:       common.Hash(*asset.Content),
 		ContentType:       asset.ContentType,
@@ -296,13 +304,19 @@ func (s *assetService) UpdateWorkingDirectory(path string) {
 
 func (s *assetService) mapRepoAssetToAsset(repoAsset DBAsset) Asset {
 	asset := Asset{
-		ID:          repoAsset.ID,
-		URL:         repoAsset.URL,
-		ContentType: repoAsset.ContentType,
-		Project:     repoAsset.Project,
-		Path:        repoAsset.FileSystemPath,
+		DiscoveryBaseURL:  repoAsset.DiscoveryBaseURL,
+		ID:                repoAsset.ID,
+		IsInlineJS:        repoAsset.IsInlineJS,
+		IsBeautified:      repoAsset.IsBeautified,
+		IsChunkDiscovered: repoAsset.IsChunkDiscovered,
+		ChunkFromAssetID:  repoAsset.ChunkFromAssetID,
+		URL:               repoAsset.URL,
+		ContentType:       repoAsset.ContentType,
+		Project:           repoAsset.Project,
+		Path:              repoAsset.FileSystemPath,
 	}
 
+	_ = json.Unmarshal([]byte(repoAsset.RequestHeaders), &asset.RequestHeaders)
 	children := []Asset{}
 	for _, child := range repoAsset.Children {
 		children = append(children, s.mapRepoAssetToAsset(child))

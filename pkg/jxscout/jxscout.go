@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	assetfetcher "github.com/francisconeves97/jxscout/internal/core/asset-fetcher"
@@ -29,6 +32,7 @@ import (
 	jsingestion "github.com/francisconeves97/jxscout/internal/modules/js-ingestion"
 	"github.com/francisconeves97/jxscout/internal/modules/overrides"
 	"github.com/francisconeves97/jxscout/internal/modules/sourcemaps"
+	"github.com/francisconeves97/jxscout/internal/modules/webcrack"
 	jxscouttypes "github.com/francisconeves97/jxscout/pkg/types"
 	"github.com/jmoiron/sqlx"
 
@@ -62,6 +66,10 @@ type jxscout struct {
 }
 
 func CheckAndMigrateOldVersion() error {
+	if os.Getenv("JXSCOUT_PROJECT_ROOT") != "" || os.Getenv("JXSCOUT_DATA_DIR") != "" {
+		return nil
+	}
+
 	privateDirRoot := common.GetPrivateDirectoryRoot()
 	workingDirRoot := filepath.Join(common.GetHome(), "jxscout")
 	currentProjectPath := filepath.Join(privateDirRoot, "current_project")
@@ -170,6 +178,7 @@ func initJxscout(options jxscouttypes.Options) (*jxscout, error) {
 	httpServer := newHttpServer(logger)
 
 	assetFetcher := assetfetcher.NewAssetFetcher(assetfetcher.AssetFetcherOptions{
+		AllowedURL:                       scopeChecker.IsInScope,
 		RateLimitingMaxRequestsPerMinute: options.RateLimitingMaxRequestsPerMinute,
 		RateLimitingMaxRequestsPerSecond: options.RateLimitingMaxRequestsPerSecond,
 	})
@@ -205,6 +214,7 @@ func (s *jxscout) registerCoreModules() {
 		jsingestion.NewJSIngestionModule(s.options.DownloadReferedJS),
 		htmlingestion.NewHTMLIngestionModule(),
 		beautifier.NewBeautifier(s.options.BeautifierConcurrency),
+		webcrack.New(s.options.BeautifierConcurrency, s.options.WebcrackMode),
 		chunkdiscoverer.NewChunkDiscovererModule(
 			s.options.ChunkDiscovererConcurrency,
 			s.options.ChunkDiscovererBruteForceLimit,
@@ -240,6 +250,13 @@ func (s *jxscout) Start() error {
 		return errutil.Wrap(err, "failed to start server")
 	}
 
+	if os.Getenv("JXSCOUT_HEADLESS") == "true" {
+		signals := make(chan os.Signal, 1)
+		signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+		defer signal.Stop(signals)
+		<-signals
+		return s.Stop()
+	}
 	s.runPrompt()
 
 	return nil
@@ -266,14 +283,19 @@ func (s *jxscout) start() error {
 		Handler: r,
 	}
 
+	listener, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		s.cancel()
+		return err
+	}
 	if os.Getenv("JXSCOUT_DEBUG") == "true" {
-		err := s.server.ListenAndServe()
+		err := s.server.Serve(listener)
 		if err != nil && err != http.ErrServerClosed {
 			s.log.Error("failed to start server", "port", s.options.Port, "error", err)
 		}
 	} else {
 		go func() {
-			err := s.server.ListenAndServe()
+			err := s.server.Serve(listener)
 			if err != nil && err != http.ErrServerClosed {
 				s.log.Error("failed to start server", "port", s.options.Port, "error", err)
 				return
@@ -331,7 +353,9 @@ func (s *jxscout) Stop() error {
 		return errutil.Wrap(err, "failed to shutdown websocket server gracefully")
 	}
 
-	if err := s.server.Shutdown(s.ctx); err != nil {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.server.Shutdown(shutdownCtx); err != nil {
 		s.log.Error("failed to shutdown server gracefully", "error", err)
 		return errutil.Wrap(err, "failed to shutdown server gracefully")
 	}

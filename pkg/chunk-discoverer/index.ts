@@ -1,3 +1,4 @@
+import { deepDiscover, inferTemplate } from "./discoverer/deep";
 import * as fs from "fs";
 import { discoverChunks } from "./discoverer/discoverer";
 
@@ -25,7 +26,14 @@ try {
 
   const code = readFile(path);
 
-  const chunks = discoverChunks(code, bruteForceLimit);
+  const urls: string[] = process.argv[4] ? JSON.parse(process.argv[4]) : [];
+  const templates = urls.map(inferTemplate).filter((t): t is string => !!t);
+  const chunks = [
+    ...new Set([
+      ...discoverChunks(code, bruteForceLimit),
+      ...deepDiscover(code, templates, bruteForceLimit).map((c) => c.specifier),
+    ]),
+  ];
 
   chunks.forEach((chunk) => console.log(chunk));
 

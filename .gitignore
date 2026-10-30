@@ -4,3 +4,8 @@ dist
 extracted
 .DS_Store
 .cursor
+!pkg/agent-cli/dist/
+pkg/agent-cli/dist/*
+!pkg/agent-cli/dist/agent-cli.js
+
+/jxscout
