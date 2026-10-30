@@ -1,7 +1,14 @@
+import { createHash } from "node:crypto";
 import { test, expect } from "vitest";
 import { createServer } from "node:http";
 import { connect } from "node:net";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  readFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -81,7 +88,10 @@ test.skipIf(!binary)(
       requestedPaths.push(req.url ?? "");
       if (req.url === "/99999.deadbeef.js") {
         res.writeHead(200, { "Content-Type": "application/javascript" });
-        res.end("const hiddenChunk = true;");
+        res.end("import('./nested.js'); const hiddenChunk = true;");
+      } else if (req.url === "/nested.js") {
+        res.writeHead(200, { "Content-Type": "application/javascript" });
+        res.end("const recursiveChunk = true;");
       } else {
         res.writeHead(404);
         res.end("not found");
@@ -151,20 +161,19 @@ test.skipIf(!binary)(
       serve.stderr.on("data", (chunk) => (serveStderr += chunk));
       await waitForListener(serve, servePort, () => serveStderr);
 
-      const ingest = await fetch(`http://127.0.0.1:${servePort}/ingest`, {
+      expect(serveStderr).toContain("Waiting for Burp/Caido traffic");
+      expect(serveStderr).toContain(path.join(target, "jxscout"));
+      const capturedBody = '  const table={99999:"deadbeef"};\r\n';
+      // Match the upstream Burp extension, including its omitted requestUrl port.
+      const ingest = await fetch(`http://127.0.0.1:${servePort}/caido-ingest`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          request: {
-            method: "GET",
-            url: `${fixtureOrigin}/7.aabbccdd.js`,
-            headers: {},
-          },
-          response: {
-            status: 200,
-            headers: { "Content-Type": "application/javascript" },
-            body: 'const table={99999:"deadbeef"};',
-          },
+          requestUrl: "http://127.0.0.1/7.aabbccdd.js",
+          request: `GET /7.aabbccdd.js HTTP/1.1\r\nUser-Agent: Burp\r\nHost: 127.0.0.1:${fixturePort}\r\n\r\n`,
+          response:
+            "HTTP/2 200\r\ncontent-type: application/javascript\r\n\r\n" +
+            capturedBody,
         }),
       });
       expect(ingest.status).toBe(202);
@@ -180,7 +189,8 @@ test.skipIf(!binary)(
       while (
         Date.now() < deadline &&
         (!requestedPaths.includes("/99999.deadbeef.js") ||
-          !existsSync(savedChunk))
+          !existsSync(savedChunk) ||
+          !requestedPaths.includes("/nested.js"))
       ) {
         if (serve.exitCode !== null || serve.signalCode !== null)
           throw new Error(
@@ -190,6 +200,16 @@ test.skipIf(!binary)(
       }
       expect(requestedPaths).toContain("/99999.deadbeef.js");
       expect(existsSync(savedChunk)).toBe(true);
+      expect(requestedPaths).toContain("/nested.js");
+      const snapshot = path.join(
+        target,
+        "jxscout",
+        "raw",
+        createHash("sha256").update(capturedBody).digest("hex"),
+        `127.0.0.1:${fixturePort}`,
+        "7.aabbccdd.js",
+      );
+      expect(readFileSync(snapshot, "utf8")).toBe(capturedBody);
       expect(
         existsSync(
           path.join(target, "jxscout", ".state", "foo", "db", "db.sql"),

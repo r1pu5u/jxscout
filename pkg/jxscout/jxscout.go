@@ -251,6 +251,7 @@ func (s *jxscout) Start() error {
 	}
 
 	if os.Getenv("JXSCOUT_HEADLESS") == "true" {
+		fmt.Fprintf(os.Stderr, "JXScout listening on http://%s:%d\nProject: %s\nOutput: %s\nScope: %s\nWaiting for Burp/Caido traffic. Stop with Ctrl-C.\n", s.options.Hostname, s.options.Port, s.options.ProjectName, common.GetWorkingDirectory(s.options.ProjectName), strings.Join(s.options.ScopePatterns, ", "))
 		signals := make(chan os.Signal, 1)
 		signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
 		defer signal.Stop(signals)

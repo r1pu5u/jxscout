@@ -18,13 +18,13 @@ import { analyzeFile } from "../ast-analyzer/analyzer";
 const help = `JXScout — JavaScript discovery and analysis
 
   init --project NAME --scope GLOB  Initialize ./jxscout in this directory
-  scan <url>             Recursively download and analyze JavaScript
-  scan --list urls.txt   Seed discovery with known chunk URLs
-  analyze <path>         Analyze local JavaScript or a directory
+  serve                  Receive Burp/Caido traffic and automatically save JavaScript
+  tui                    Open the capture dashboard
   assets|chunks|findings|runs  Query project results
   doctor                 Check processing dependencies
-  serve                  Run proxy capture without a terminal UI
-  tui                    Open the capture dashboard
+  analyze <path>         Optional analysis of files already on disk
+
+Start serve, connect the Burp extension to localhost:3333, and browse your target.
 
 Options: --project NAME --format text|json|jsonl --webcrack auto|off|required
   --chunk-template 'https://host/assets/{id}.{hash}.js' (repeatable)
@@ -45,7 +45,6 @@ const { values: v, positionals } = parseArgs({
     "public-path": { type: "string" },
     "base-url": { type: "string" },
     fetch: { type: "boolean" },
-    list: { type: "string" },
     "max-assets": { type: "string", default: "10000" },
     "bruteforce-limit": { type: "string", default: "3000" },
     search: { type: "string", default: "" },
@@ -117,6 +116,22 @@ function findWorkspace(
     current = parent;
   }
 }
+if (command === "scan")
+  throw Error(
+    "The scan command was removed. Run 'jxscout serve' and browse the target through Burp/Caido to capture JavaScript automatically.",
+  );
+if (
+  ![
+    "init",
+    "doctor",
+    "assets",
+    "chunks",
+    "findings",
+    "runs",
+    "analyze",
+  ].includes(command)
+)
+  throw Error(`Unknown command: ${command}`);
 const workspace = findWorkspace(process.cwd());
 if (command === "init") {
   const target =
@@ -246,8 +261,7 @@ if (["runs", "assets", "chunks", "findings"].includes(command)) {
   });
   process.exit(0);
 }
-if (!["scan", "analyze"].includes(command))
-  throw Error(`Unknown command: ${command}`);
+if (command !== "analyze") throw Error(`Unknown command: ${command}`);
 if (v.webcrack === "required" && !tools.webcrack)
   throw Error("webcrack is required but not installed");
 const webcrackVersion =
@@ -269,15 +283,10 @@ process.on("SIGINT", interrupted);
 process.on("SIGTERM", interrupted);
 
 let seeds = [...positionals];
-if (v.list)
-  seeds.push(
-    ...fs
-      .readFileSync(v.list, "utf8")
-      .split(/\r?\n/)
-      .map((x) => x.trim())
-      .filter(Boolean),
+if (!seeds.length)
+  throw Error(
+    "A local file or directory is required. Use 'jxscout serve' to capture browser traffic.",
   );
-if (!seeds.length) throw Error("A URL, file, directory, or --list is required");
 function localFiles(p: string): string[] {
   return fs.statSync(p).isDirectory()
     ? fs
@@ -289,18 +298,12 @@ function localFiles(p: string): string[] {
       ? [pathToFileURL(path.resolve(p)).href]
       : [];
 }
-if (command === "analyze") seeds = seeds.flatMap(localFiles);
+seeds = seeds.flatMap(localFiles);
 if (!seeds.length) throw Error("No supported source files found");
-for (const seed of seeds) {
-  const parsed = new URL(seed);
-  if (command === "scan" && !["http:", "https:"].includes(parsed.protocol))
-    throw Error("scan requires HTTP(S) URLs; use analyze for local files");
-}
 const localRoots = seeds
   .filter((s) => s.startsWith("file:"))
   .map((s) => path.dirname(fs.realpathSync(fileURLToPath(s))));
 function allowedLocalFile(url: URL): boolean {
-  if (command !== "analyze") return false;
   const resolved = fs.realpathSync(fileURLToPath(url));
   return localRoots.some((root) => {
     const relative = path.relative(root, resolved);
@@ -313,7 +316,7 @@ function allowedLocalFile(url: URL): boolean {
 }
 function matchesScope(url: string | URL): boolean {
   const parsed = typeof url === "string" ? new URL(url) : url;
-  if (parsed.protocol === "file:") return command === "analyze";
+  if (parsed.protocol === "file:") return true;
   if (!v.scope?.length) return true;
   const href = typeof url === "string" ? new URL(url).href : url.href;
   return v.scope.some((pattern) =>
@@ -367,8 +370,7 @@ function schedule(
     target.hash = "";
     if (!["http:", "https:", "file:"].includes(target.protocol)) return;
     if (target.protocol === "file:" && !allowedLocalFile(target)) return;
-    if (command === "analyze" && target.protocol !== "file:" && !v.fetch)
-      return;
+    if (target.protocol !== "file:" && !v.fetch) return;
     if (!matchesScope(target)) return;
     db.query("INSERT INTO chunks VALUES(?,?,?,?,?,?)").run(
       run,
@@ -523,8 +525,7 @@ async function analyze(
               throw Error("Source map outside local input roots");
             text = fs.readFileSync(fileURLToPath(target), "utf8");
           } else {
-            if (command === "analyze" && !v.fetch)
-              throw Error("Remote source map requires --fetch");
+            if (!v.fetch) throw Error("Remote source map requires --fetch");
             await Bun.sleep(Math.max(0, 500 - (Date.now() - lastRequest)));
             lastRequest = Date.now();
             const response = await fetch(target, {

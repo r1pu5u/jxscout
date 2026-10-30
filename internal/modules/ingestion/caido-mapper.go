@@ -3,6 +3,8 @@ package ingestion
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 
@@ -21,7 +23,7 @@ func parseHeader(line string) (header, error) {
 	}
 
 	return header{
-		key:   strings.TrimSpace(parts[0]),
+		key:   http.CanonicalHeaderKey(strings.TrimSpace(parts[0])),
 		value: strings.TrimSpace(parts[1]),
 	}, nil
 }
@@ -51,28 +53,15 @@ type rawHTTP struct {
 }
 
 func splitHeaderFromBody(httpStr string) (rawHTTP, error) {
-	httpStr = strings.ReplaceAll(httpStr, "\r\n", "\n")
-	httpStr = strings.TrimSpace(httpStr)
-	parts := strings.SplitN(httpStr, "\n\n", 2)
-
-	if len(parts) == 0 {
-		return rawHTTP{}, errors.New("should be able to split in at least one part")
+	for _, separator := range []string{"\r\n\r\n", "\n\n"} {
+		if index := strings.Index(httpStr, separator); index >= 0 {
+			return rawHTTP{
+				Header: httpStr[:index],
+				Body:   httpStr[index+len(separator):],
+			}, nil
+		}
 	}
-
-	if len(parts) > 2 {
-		return rawHTTP{}, errors.New("should be able to split in two or less parts")
-	}
-
-	if len(parts) == 1 {
-		return rawHTTP{
-			Header: strings.TrimSpace(parts[0]),
-		}, nil
-	}
-
-	return rawHTTP{
-		Header: strings.TrimSpace(parts[0]),
-		Body:   strings.TrimSpace(parts[1]),
-	}, nil
+	return rawHTTP{Header: strings.TrimRight(httpStr, "\r\n")}, nil
 }
 
 func parseRequest(req string, reqURL string) (Request, error) {
@@ -83,23 +72,26 @@ func parseRequest(req string, reqURL string) (Request, error) {
 
 	lines := strings.Split(httpReq.Header, "\n")
 
-	if len(lines) <= 2 {
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
 		return Request{}, errors.New("not enough lines to be a valid request")
 	}
 
-	linesWithoutReqAndHost := lines[2:]
-
 	requestDescriptionLine := lines[0]
-	requestDescLineParts := strings.Split(requestDescriptionLine, " ")
+	requestDescLineParts := strings.Fields(requestDescriptionLine)
 	if len(requestDescLineParts) < 3 {
 		return Request{}, errors.New("request description line should have at least len 3")
 	}
 
 	method := strings.TrimSpace(requestDescLineParts[0])
 
-	headers, err := parseHeaders(linesWithoutReqAndHost)
+	headers, err := parseHeaders(lines[1:])
 	if err != nil {
 		return Request{}, errutil.Wrap(err, "failed to parse headers")
+	}
+	if recoveredURL, err := recoverPortFromHost(reqURL, headers["Host"]); err != nil {
+		return Request{}, errutil.Wrap(err, "failed to recover request port")
+	} else {
+		reqURL = recoveredURL
 	}
 
 	return Request{
@@ -117,7 +109,7 @@ func parseResponse(res string) (Response, error) {
 
 	lines := strings.Split(httpRes.Header, "\n")
 
-	if len(lines) <= 2 {
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
 		return Response{}, errors.New("not enough lines to be a valid response")
 	}
 
@@ -128,9 +120,9 @@ func parseResponse(res string) (Response, error) {
 		return Response{}, errutil.Wrap(err, "failed to parse headers")
 	}
 
-	statusParts := strings.Split(lines[0], " ")
-	if len(statusParts) < 3 {
-		return Response{}, fmt.Errorf("status part should have at least len 3. line: %s", lines[0])
+	statusParts := strings.Fields(lines[0])
+	if len(statusParts) < 2 {
+		return Response{}, fmt.Errorf("status part should have at least len 2. line: %s", lines[0])
 	}
 
 	status := statusParts[1]
@@ -144,6 +136,29 @@ func parseResponse(res string) (Response, error) {
 		Body:    httpRes.Body,
 		Headers: headers,
 	}, nil
+}
+
+func recoverPortFromHost(rawURL string, hostHeader string) (string, error) {
+	if hostHeader == "" {
+		return rawURL, nil
+	}
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	if parsedURL.Port() != "" || parsedURL.Hostname() == "" {
+		return rawURL, nil
+	}
+	parsedHost, err := url.Parse("//" + hostHeader)
+	if err != nil {
+		return rawURL, nil
+	}
+	port := parsedHost.Port()
+	if port == "" || !strings.EqualFold(parsedURL.Hostname(), parsedHost.Hostname()) {
+		return rawURL, nil
+	}
+	parsedURL.Host = parsedHost.Host
+	return parsedURL.String(), nil
 }
 
 func mapCaidoRequest(req caidoIngestRequest) (IngestionRequest, error) {

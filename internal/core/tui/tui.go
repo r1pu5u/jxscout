@@ -325,7 +325,7 @@ func (t *TUI) View() string {
 	s.WriteString(fmt.Sprintf("JXScout  |  project: %s  |  capture: %s:%d\n", options.ProjectName, options.Hostname, options.Port))
 	s.WriteString(fmt.Sprintf("Output: %s\n", common.GetWorkingDirectory(options.ProjectName)))
 	if t.output == "" {
-		s.WriteString("\nassets · loads · loaded · config · logs · help\nUse jxscout scan --help for standalone analysis.\n")
+		s.WriteString("\nassets · loads · loaded · config · logs · help\nCapture traffic through Burp/Caido; use jxscout analyze --help for local files.\n")
 	}
 
 	// Render output
