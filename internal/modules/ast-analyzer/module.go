@@ -20,7 +20,6 @@ import (
 	"github.com/francisconeves97/jxscout/internal/core/errutil"
 	"github.com/francisconeves97/jxscout/internal/modules/beautifier"
 	"github.com/francisconeves97/jxscout/internal/modules/sourcemaps"
-	"github.com/francisconeves97/jxscout/internal/modules/webcrack"
 	jxscouttypes "github.com/francisconeves97/jxscout/pkg/types"
 )
 
@@ -154,14 +153,6 @@ func (m *astAnalyzerModule) Initialize(sdk *jxscouttypes.ModuleSDK) error {
 }
 
 func (m *astAnalyzerModule) subscribeAssetBeautified() error {
-	m.sdk.DBEventBus.Subscribe(m.sdk.Ctx, webcrack.TopicArtifactSaved, "ast-analyzer-webcrack", func(ctx context.Context, payload []byte) error {
-		var event webcrack.EventArtifactSaved
-		if err := json.Unmarshal(payload, &event); err != nil {
-			return err
-		}
-		_, err := m.analyzeAsset(asset{ID: event.ArtifactID, Path: event.Path, AssetType: "webcrack"})
-		return err
-	}, dbeventbus.Options{Concurrency: m.concurrency, MaxRetries: 1, Backoff: common.ExponentialBackoff, PollInterval: time.Second, HeartbeatInterval: 10 * time.Second})
 
 	m.sdk.DBEventBus.Subscribe(m.sdk.Ctx, beautifier.TopicBeautifierAssetSaved, "ast-analyzer", func(ctx context.Context, payload []byte) error {
 		var event beautifier.EventBeautifierAssetSaved

@@ -73,3 +73,40 @@ test("function aliases resolve known hash keys", () => {
   );
   expect(found.map((c) => c.specifier)).toEqual(["99999.deadbeef.js"]);
 });
+test("precache object manifests use literal URLs instead of revision as an ID", () => {
+  const candidates = deepDiscover(
+    'self.__precacheManifest=[{revision:"958b322be5e6e870bba9",url:"/js/Dashboard.8f210c78.js"},{revision:"1122334455667788",url:"/css/app.css"}];',
+    ["https://h/js/{id}.{hash}.js"],
+    0,
+  );
+  expect(candidates.map((c) => c.specifier)).toEqual([
+    "/js/Dashboard.8f210c78.js",
+  ]);
+});
+test("ordinary application object strings are not chunk hashes", () => {
+  const result = deepDiscover(
+    'const opts={prefix:"theme-one",staticClass:"vue-street-view-pano",key:"language",expression:"showMonthView"};',
+    ["https://h/js/{id}.{hash}.js"],
+    0,
+  );
+  expect(result).toEqual([]);
+});
+test("named chunk map does not double the chunk prefix", () => {
+  const result = deepDiscover(
+    'const hash={"chunk-123":"deadbeef"};',
+    ["https://h/js/chunk-{id}.{hash}.js"],
+    0,
+  );
+  expect(result.map((c) => c.specifier)).toContain(
+    "https://h/js/chunk-123.deadbeef.js",
+  );
+  expect(result.some((c) => c.specifier.includes("chunk-chunk"))).toBe(false);
+});
+test("CSS hash tables do not generate JavaScript requests", () => {
+  const code =
+    'function css(id){return "css/"+id+"."+{Dashboard:"11111111"}[id]+".css"} function js(id){return "js/"+id+"."+{Dashboard:"22222222"}[id]+".js"}';
+  const urls = deepDiscover(code, ["https://h/js/{id}.{hash}.js"], 0).map(
+    (c) => c.specifier,
+  );
+  expect(urls).toEqual(["https://h/js/Dashboard.22222222.js"]);
+});

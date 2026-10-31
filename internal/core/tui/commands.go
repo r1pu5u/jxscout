@@ -105,8 +105,52 @@ func (t *TUI) RegisterDefaultCommands() {
 		Description: "Toggle logs panel",
 		Usage:       "logs",
 		Execute: func(args []string) (tea.Cmd, error) {
-			t.logsPanelShown = !t.logsPanelShown
+			if t.logsPanelShown {
+				t.closePanel()
+			} else {
+				t.openPanel("logs")
+			}
 			return nil, nil
+		},
+	})
+
+	t.RegisterCommand(Command{
+		Name:        "project",
+		Description: "Show or change the active capture project",
+		Usage:       "project [NAME]",
+		Execute: func(args []string) (tea.Cmd, error) {
+			if len(args) == 0 {
+				t.writeLineToOutput(fmt.Sprintf("Project: %s\nOutput: %s", t.jxscout.GetOptions().ProjectName, common.GetWorkingDirectory(t.jxscout.GetOptions().ProjectName)))
+				return nil, nil
+			}
+			if len(args) != 1 {
+				return nil, fmt.Errorf("usage: project [NAME]")
+			}
+			if err := common.ValidateProjectName(args[0]); err != nil {
+				return nil, err
+			}
+			return t.commands["config"].Execute([]string{"project-name=" + args[0]})
+		},
+	})
+
+	t.RegisterCommand(Command{
+		Name: "scope", Description: "Show, add, or remove URL scope patterns",
+		Usage: "scope [add|remove PATTERN]",
+		Execute: func(args []string) (tea.Cmd, error) {
+			if len(args) == 0 {
+				scopes := t.jxscout.GetOptions().ScopePatterns
+				if len(scopes) == 0 {
+					t.writeLineToOutput("Scope: all URLs (no patterns)")
+				}
+				for _, pattern := range scopes {
+					t.writeLineToOutput("  " + pattern)
+				}
+				return nil, nil
+			}
+			if len(args) != 2 || (args[0] != "add" && args[0] != "remove") {
+				return nil, fmt.Errorf("usage: scope [add|remove PATTERN]")
+			}
+			return t.commands["config"].Execute([]string{"scope=" + args[0] + ":" + args[1]})
 		},
 	})
 
@@ -129,7 +173,20 @@ func (t *TUI) RegisterDefaultCommands() {
 			// Get current options
 			currentOptions := t.jxscout.GetOptions()
 
-			changedOptions := []string{}
+			// Load the selected project before applying any other explicit edits.
+			for _, arg := range args {
+				key, value, ok := strings.Cut(arg, "=")
+				if ok && (key == constants.FlagProjectName || key == "project") {
+					if value == "default" {
+						value = constants.DefaultProjectName
+					}
+					var err error
+					currentOptions, err = t.projectOptions(value)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
 
 			// Parse arguments
 			for _, arg := range args {
@@ -139,9 +196,10 @@ func (t *TUI) RegisterDefaultCommands() {
 				}
 
 				option := parts[0]
+				if option == "project" {
+					option = constants.FlagProjectName
+				}
 				value := parts[1]
-
-				changedOptions = append(changedOptions, option)
 
 				// Check if we're resetting to default
 				if value == "default" {
@@ -238,6 +296,11 @@ func (t *TUI) RegisterDefaultCommands() {
 
 				// Update the appropriate option
 				switch option {
+				case "webcrack":
+					if value != "auto" && value != "off" && value != "required" {
+						return nil, fmt.Errorf("webcrack must be auto, off or required")
+					}
+					currentOptions.WebcrackMode = value
 				case constants.FlagPort:
 					port, err := strconv.Atoi(value)
 					if err != nil {
@@ -350,131 +413,26 @@ func (t *TUI) RegisterDefaultCommands() {
 				}
 			}
 
-			for _, option := range changedOptions {
-				if option == constants.FlagProjectName {
-					configFileLocation := filepath.Join(common.GetPrivateDirectory(currentOptions.ProjectName), constants.ConfigFileName)
-					exists, err := common.FileExists(configFileLocation)
-					if err != nil {
-						// If there's an error checking file existence, continue with current options
-						continue
-					}
-
-					if !exists {
-						// If file doesn't exist, use default options
-						currentOptions = jxscouttypes.Options{
-							Port:                             constants.DefaultPort,
-							Hostname:                         constants.DefaultHostname,
-							ProjectName:                      currentOptions.ProjectName, // Keep the new project name
-							ScopePatterns:                    nil,
-							Debug:                            constants.DefaultDebug,
-							AssetSaveConcurrency:             constants.DefaultAssetSaveConcurrency,
-							AssetFetchConcurrency:            constants.DefaultAssetFetchConcurrency,
-							BeautifierConcurrency:            constants.DefaultBeautifierConcurrency,
-							JavascriptRequestsCacheTTL:       constants.DefaultJavascriptRequestsCacheTTL,
-							HTMLRequestsCacheTTL:             constants.DefaultHTMLRequestsCacheTTL,
-							ChunkDiscovererConcurrency:       constants.DefaultChunkDiscovererConcurrency,
-							ASTAnalyzerConcurrency:           constants.DefaultASTAnalyzerConcurrency,
-							ChunkDiscovererBruteForceLimit:   constants.DefaultChunkDiscovererBruteForceLimit,
-							RateLimitingMaxRequestsPerMinute: constants.DefaultRateLimitingMaxRequestsPerMinute,
-							RateLimitingMaxRequestsPerSecond: constants.DefaultRateLimitingMaxRequestsPerSecond,
-							DownloadReferedJS:                constants.DefaultDownloadReferedJS,
-							LogBufferSize:                    constants.DefaultLogBufferSize,
-							LogFileMaxSizeMB:                 constants.DefaultLogFileMaxSizeMB,
-							CaidoHostname:                    constants.DefaultCaidoHostname,
-							CaidoPort:                        constants.DefaultCaidoPort,
-							OverrideContentCheckInterval:     constants.DefaultOverrideContentCheckInterval,
-						}
-					} else {
-						// Read existing config
-						existingOptions := &jxscouttypes.Options{}
-						configData, err := os.ReadFile(configFileLocation)
-						if err != nil {
-							// If we can't read the config, just continue with current options
-							continue
-						}
-						if err := yaml.Unmarshal(configData, existingOptions); err != nil {
-							// If we can't parse the config, just continue with current options
-							continue
-						}
-
-						// Create a map of changed options for quick lookup
-						changedOptionsMap := make(map[string]bool)
-						for _, opt := range changedOptions {
-							changedOptionsMap[opt] = true
-						}
-
-						// Merge options, keeping changed values from currentOptions
-						if !changedOptionsMap[constants.FlagPort] {
-							currentOptions.Port = existingOptions.Port
-						}
-						if !changedOptionsMap[constants.FlagHostname] {
-							currentOptions.Hostname = existingOptions.Hostname
-						}
-						if !changedOptionsMap[constants.FlagProjectName] {
-							currentOptions.ProjectName = existingOptions.ProjectName
-						}
-						if !changedOptionsMap[constants.FlagScope] {
-							currentOptions.ScopePatterns = existingOptions.ScopePatterns
-						}
-						if !changedOptionsMap[constants.FlagDebug] {
-							currentOptions.Debug = existingOptions.Debug
-						}
-						if !changedOptionsMap[constants.FlagAssetSaveConcurrency] {
-							currentOptions.AssetSaveConcurrency = existingOptions.AssetSaveConcurrency
-						}
-						if !changedOptionsMap[constants.FlagAssetFetchConcurrency] {
-							currentOptions.AssetFetchConcurrency = existingOptions.AssetFetchConcurrency
-						}
-						if !changedOptionsMap[constants.FlagBeautifierConcurrency] {
-							currentOptions.BeautifierConcurrency = existingOptions.BeautifierConcurrency
-						}
-						if !changedOptionsMap[constants.FlagChunkDiscovererConcurrency] {
-							currentOptions.ChunkDiscovererConcurrency = existingOptions.ChunkDiscovererConcurrency
-						}
-						if !changedOptionsMap[constants.FlagASTAnalyzerConcurrency] {
-							currentOptions.ASTAnalyzerConcurrency = existingOptions.ASTAnalyzerConcurrency
-						}
-						if !changedOptionsMap[constants.FlagChunkDiscovererBruteForceLimit] {
-							currentOptions.ChunkDiscovererBruteForceLimit = existingOptions.ChunkDiscovererBruteForceLimit
-						}
-						if !changedOptionsMap[constants.FlagJavascriptRequestsCacheTTL] {
-							currentOptions.JavascriptRequestsCacheTTL = existingOptions.JavascriptRequestsCacheTTL
-						}
-						if !changedOptionsMap[constants.FlagHTMLRequestsCacheTTL] {
-							currentOptions.HTMLRequestsCacheTTL = existingOptions.HTMLRequestsCacheTTL
-						}
-						if !changedOptionsMap[constants.FlagRateLimitingMaxRequestsPerSecond] {
-							currentOptions.RateLimitingMaxRequestsPerSecond = existingOptions.RateLimitingMaxRequestsPerSecond
-						}
-						if !changedOptionsMap[constants.FlagRateLimitingMaxRequestsPerMinute] {
-							currentOptions.RateLimitingMaxRequestsPerMinute = existingOptions.RateLimitingMaxRequestsPerMinute
-						}
-						if !changedOptionsMap[constants.FlagDownloadReferedJS] {
-							currentOptions.DownloadReferedJS = existingOptions.DownloadReferedJS
-						}
-						if !changedOptionsMap[constants.FlagLogBufferSize] {
-							currentOptions.LogBufferSize = existingOptions.LogBufferSize
-						}
-						if !changedOptionsMap[constants.FlagLogFileMaxSizeMB] {
-							currentOptions.LogFileMaxSizeMB = existingOptions.LogFileMaxSizeMB
-						}
-						if !changedOptionsMap[constants.FlagCaidoHostname] {
-							currentOptions.CaidoHostname = existingOptions.CaidoHostname
-						}
-						if !changedOptionsMap[constants.FlagCaidoPort] {
-							currentOptions.CaidoPort = existingOptions.CaidoPort
-						}
-						if !changedOptionsMap[constants.FlagOverrideContentCheckInterval] {
-							currentOptions.OverrideContentCheckInterval = existingOptions.OverrideContentCheckInterval
-						}
-					}
+			// Switch the output root before initializing the new project's services.
+			previousRoot := os.Getenv("JXSCOUT_PROJECT_ROOT")
+			if currentOptions.ProjectName != t.jxscout.GetOptions().ProjectName && os.Getenv("JXSCOUT_DATA_DIR") == "" {
+				project, found, err := common.RegisteredProject(currentOptions.ProjectName)
+				if err != nil {
+					return nil, err
+				}
+				if found {
+					os.Setenv("JXSCOUT_PROJECT_ROOT", project.Root)
 				}
 			}
-
-			// Restart jxscout with new options
 			newjxscout, err := t.jxscout.Restart(currentOptions)
 			if err != nil {
+				os.Setenv("JXSCOUT_PROJECT_ROOT", previousRoot)
 				return nil, fmt.Errorf("failed to restart jxscout: %w", err)
+			}
+
+			t.jxscout = newjxscout
+			if err := common.SaveWorkspaceSelection(currentOptions.ProjectName, currentOptions.ScopePatterns); err != nil {
+				return nil, err
 			}
 
 			// Persist the current options to a YAML file
@@ -492,8 +450,6 @@ func (t *TUI) RegisterDefaultCommands() {
 			if err != nil {
 				return nil, fmt.Errorf("failed to encode configuration to YAML: %w", err)
 			}
-
-			t.jxscout = newjxscout
 
 			t.writeLineToOutput("jxscout has been restarted with the new configuration! 🎉\n")
 			t.printCurrentConfig()

@@ -1,3 +1,4 @@
+import { isJavaScript } from "./validate";
 import { deepDiscover, inferTemplate } from "./discoverer/deep";
 import * as fs from "fs";
 import { discoverChunks } from "./discoverer/discoverer";
@@ -21,10 +22,16 @@ function readFile(path: string): string {
   return fs.readFileSync(path, "utf-8");
 }
 
+if (process.argv[2] === "--validate") {
+  const valid = isJavaScript(fs.readFileSync(0, "utf8"));
+  process.stdout.write(JSON.stringify({ valid }));
+  process.exit(0);
+}
+
 try {
   const { path, bruteForceLimit } = parseArgs();
 
-  const code = readFile(path);
+  const code = path === "--stdin" ? fs.readFileSync(0, "utf8") : readFile(path);
 
   const urls: string[] = process.argv[4] ? JSON.parse(process.argv[4]) : [];
   const templates = urls.map(inferTemplate).filter((t): t is string => !!t);

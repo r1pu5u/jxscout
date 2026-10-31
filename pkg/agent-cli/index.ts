@@ -18,8 +18,8 @@ import { analyzeFile } from "../ast-analyzer/analyzer";
 const help = `JXScout — JavaScript discovery and analysis
 
   init --project NAME --scope GLOB  Initialize ./jxscout in this directory
-  serve                  Receive Burp/Caido traffic and automatically save JavaScript
-  tui                    Open the capture dashboard
+  serve [--project NAME] Open the capture dashboard and receive Burp/Caido traffic
+    --headless           Run capture without the dashboard
   assets|chunks|findings|runs  Query project results
   doctor                 Check processing dependencies
   analyze <path>         Optional analysis of files already on disk
@@ -116,6 +116,37 @@ function findWorkspace(
     current = parent;
   }
 }
+const projectsFile =
+  process.env.JXSCOUT_PROJECTS_FILE ??
+  path.join(os.homedir(), ".config", "jxscout", "projects.json");
+function readProjects(): {
+  version: number;
+  projects: Record<string, { name: string; root: string; scope: string[] }>;
+} {
+  if (!fs.existsSync(projectsFile)) return { version: 1, projects: {} };
+  const registry = JSON.parse(fs.readFileSync(projectsFile, "utf8"));
+  if (registry.version !== 1 || !registry.projects)
+    throw Error(`Invalid project registry: ${projectsFile}`);
+  return registry;
+}
+function registerProject(name: string, root: string, scope: string[]) {
+  const registry = readProjects();
+  registry.projects[name] = { name, root, scope };
+  fs.mkdirSync(path.dirname(projectsFile), { recursive: true });
+  const temp = `${projectsFile}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(temp, JSON.stringify(registry, null, 2) + "\n", {
+      mode: 0o600,
+    });
+    fs.renameSync(temp, projectsFile);
+  } finally {
+    fs.rmSync(temp, { force: true });
+  }
+}
+if (command === "tui")
+  throw Error(
+    "The tui command was removed. Run 'jxscout serve' to open the capture dashboard.",
+  );
 if (command === "scan")
   throw Error(
     "The scan command was removed. Run 'jxscout serve' and browse the target through Burp/Caido to capture JavaScript automatically.",
@@ -132,7 +163,23 @@ if (
   ].includes(command)
 )
   throw Error(`Unknown command: ${command}`);
-const workspace = findWorkspace(process.cwd());
+let workspace = findWorkspace(process.cwd());
+if (command !== "init" && v.project && !v["data-dir"]) {
+  const saved = readProjects().projects[v.project];
+  if (saved) {
+    const marker = path.join(saved.root, "config.json");
+    if (!fs.existsSync(marker))
+      throw Error(
+        `Project ${v.project} output folder is missing its config; initialize it again: ${saved.root}`,
+      );
+    const config = JSON.parse(fs.readFileSync(marker, "utf8"));
+    workspace = {
+      root: saved.root,
+      project: v.project,
+      scope: config.project === v.project ? config.scope : saved.scope,
+    };
+  }
+}
 if (command === "init") {
   const target =
     workspace?.root === process.cwd()
@@ -145,8 +192,13 @@ if (command === "init") {
   const project =
     v.project ?? existing?.project ?? path.basename(process.cwd());
   const scope = v.scope ?? existing?.scope ?? [];
-  if (!/^[\w.-]+$/.test(project) || project === "..")
+  if (!/^[\w.-]+$/.test(project) || project === ".." || project === ".")
     throw Error("Invalid project name; supply --project NAME");
+  const registered = readProjects().projects[project];
+  if (registered && path.resolve(registered.root) !== target && !v.force)
+    throw Error(
+      `Project ${project} is already initialized at ${registered.root}; use --force to move its output folder`,
+    );
   if (existing && !v.force) {
     if (
       existing.project !== project ||
@@ -155,6 +207,7 @@ if (command === "init") {
       throw Error(
         "Workspace already initialized; use --force to update its settings",
       );
+    registerProject(project, target, scope);
     emit({
       status: "already_initialized",
       project,
@@ -170,6 +223,7 @@ if (command === "init") {
     JSON.stringify({ version: 1, project, scope }, null, 2) + "\n",
     { flag: v.force ? "w" : "wx" },
   );
+  registerProject(project, target, scope);
   emit({ status: "initialized", project, scope, output: target, config: file });
   process.exit(0);
 }
@@ -189,7 +243,7 @@ for (const key of ["max-assets", "bruteforce-limit", "page", "page-size"])
     (key !== "bruteforce-limit" && Number(v[key]) < 1)
   )
     throw Error(`Invalid ${key}`);
-if (!/^[\w.-]+$/.test(v.project!) || v.project === "..")
+if (!/^[\w.-]+$/.test(v.project!) || v.project === ".." || v.project === ".")
   throw Error("Invalid project name");
 const tools = Object.fromEntries(
   ["bun", "prettier", "webcrack"].map((name) => [name, Bun.which(name)]),
@@ -236,7 +290,7 @@ if (["runs", "assets", "chunks", "findings"].includes(command)) {
           : command === "findings"
             ? legacy
                 .query(
-                  "SELECT asset_id AS artifact,results AS result,asset_type AS kind FROM ast_analysis_results",
+                  "SELECT asset_id AS artifact,results AS result,asset_type AS kind FROM ast_analysis_results WHERE deleted_at IS NULL AND asset_type != 'webcrack'",
                 )
                 .all()
             : legacy
@@ -244,6 +298,24 @@ if (["runs", "assets", "chunks", "findings"].includes(command)) {
                   "SELECT id,url,chunk_from_asset_id AS parent FROM assets WHERE is_chunk_discovered=1",
                 )
                 .all();
+      if (
+        command === "chunks" &&
+        legacy
+          .query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='chunk_discoveries'",
+          )
+          .get()
+      ) {
+        for (const attempt of legacy
+          .query(
+            "SELECT source_asset_id AS parent,url,status,detail FROM chunk_discoveries WHERE status != 'existing'",
+          )
+          .all() as any[]) {
+          const saved = existing.find((row) => row.url === attempt.url);
+          if (saved) Object.assign(saved, attempt);
+          else existing.push(attempt);
+        }
+      }
       rows.push(
         ...existing
           .filter((r) => JSON.stringify(r).includes(v.search!))
@@ -473,10 +545,45 @@ async function analyze(
   const dir = path.join(root, "artifacts", id);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, "source.js");
-  fs.writeFileSync(file, body);
   const previous: any = db
-    .query("SELECT run FROM artifacts WHERE id=? AND run<>? LIMIT 1")
+    .query(
+      "SELECT a.run FROM artifacts a JOIN runs r ON r.id=a.run WHERE a.id=? AND a.run<>? AND r.status='completed' LIMIT 1",
+    )
     .get(id, run);
+  if (!previous || !fs.existsSync(file)) {
+    fs.writeFileSync(file, body);
+    let usedWebcrack = false;
+    if (kind === "raw" && tools.webcrack && v.webcrack !== "off") {
+      try {
+        const child = Bun.spawn([tools.webcrack, file, "--no-unpack"], {
+          stdout: "pipe",
+          stderr: "pipe",
+          timeout: 120000,
+        });
+        const [code, stderr, exitCode] = await Promise.all([
+          new Response(child.stdout).text(),
+          new Response(child.stderr).text(),
+          child.exited,
+        ]);
+        if (exitCode !== 0 || !code.trim())
+          throw Error(
+            stderr.slice(-2000) || `webcrack exited with ${exitCode}`,
+          );
+        fs.writeFileSync(file, code);
+        usedWebcrack = true;
+      } catch (e) {
+        if (v.webcrack === "required") errors.push(`webcrack ${url}: ${e}`);
+      }
+    }
+    if (!usedWebcrack && tools.prettier) {
+      const child = Bun.spawn(
+        [tools.prettier, file, "--write", "--parser=babel"],
+        { stdout: "ignore", stderr: "pipe", timeout: 30000 },
+      );
+      await new Response(child.stderr).text();
+      await child.exited;
+    }
+  }
   db.query("INSERT OR IGNORE INTO artifacts VALUES(?,?,?,?,?,?)").run(
     id,
     run,
@@ -502,6 +609,8 @@ async function analyze(
   }
   sources.push({ url, body, id });
   await discover(body, url, id);
+  const formatted = fs.readFileSync(file, "utf8");
+  if (formatted !== body) await discover(formatted, url, id);
   if (kind === "raw") {
     const reference = [
       ...body.matchAll(/[#@]\s*sourceMappingURL=([^\s*]+)/g),
@@ -550,37 +659,6 @@ async function analyze(
       } catch (e) {
         errors.push(`source map ${url}: ${e}`);
       }
-  }
-
-  if (kind === "raw" && tools.webcrack && v.webcrack !== "off") {
-    const out = path.join(dir, "webcrack");
-    const successMarker = path.join(out, ".jxscout-success");
-    try {
-      if (!fs.existsSync(successMarker)) {
-        const child = Bun.spawn([tools.webcrack, file, "-o", out, "-f"], {
-          stdout: "ignore",
-          stderr: "pipe",
-          timeout: 120000,
-        });
-        const stderr = await new Response(child.stderr).text();
-        const exitCode = await child.exited;
-        if (exitCode !== 0)
-          throw Error(
-            stderr.slice(-2000) || `webcrack exited with ${exitCode}`,
-          );
-        fs.writeFileSync(successMarker, "ok\n");
-      }
-      for (const f of localFiles(out))
-        if (/\.js$/.test(f))
-          await analyze(
-            fs.readFileSync(fileURLToPath(f), "utf8"),
-            url,
-            id,
-            "webcrack:" + path.relative(out, fileURLToPath(f)),
-          );
-    } catch (e) {
-      errors.push(`webcrack ${url}: ${e}`);
-    }
   }
 }
 while (queue.length && seen.size < Number(v["max-assets"])) {

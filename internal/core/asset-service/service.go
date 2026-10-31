@@ -128,6 +128,9 @@ func (s *assetService) initializeQueueHandlers() {
 }
 
 func (s *assetService) handleSaveAssetRequest(ctx context.Context, asset *Asset) error {
+	if common.IsCaptureNoise(asset.URL) {
+		return nil
+	}
 	s.log.DebugContext(ctx, "processing request to save asset", "asset_url", asset.URL)
 
 	dbAsset, exists, err := GetAssetByURLAndProjectName(ctx, s.db, asset.URL, s.projectName)
@@ -175,8 +178,9 @@ func (s *assetService) handleSaveAssetRequest(ctx context.Context, asset *Asset)
 				s.log.DebugContext(ctx, "file was deleted, saving again", "asset_url", asset.URL)
 
 				_, err := s.fileService.SaveInSubfolder(ctx, assetsFolder, SaveFileRequest{
-					PathURL: asset.URL,
-					Content: asset.Content,
+					JavaScript: asset.ContentType == common.ContentTypeJS,
+					PathURL:    asset.URL,
+					Content:    asset.Content,
 				})
 				if err != nil {
 					return errutil.Wrap(err, "failed to save file")
@@ -205,15 +209,10 @@ func (s *assetService) handleSaveAssetRequest(ctx context.Context, asset *Asset)
 		}
 	}
 
-	// Preserve immutable capture bytes before other modules beautify the working file.
-	if asset.Content != nil {
-		if _, err := s.fileService.SaveInSubfolder(ctx, "raw/"+common.Hash(*asset.Content), SaveFileRequest{PathURL: asset.URL, Content: asset.Content}); err != nil {
-			return err
-		}
-	}
 	path, err := s.fileService.SaveInSubfolder(ctx, assetsFolder, SaveFileRequest{
-		PathURL: asset.URL,
-		Content: asset.Content,
+		JavaScript: asset.ContentType == common.ContentTypeJS,
+		PathURL:    asset.URL,
+		Content:    asset.Content,
 	})
 	if err != nil {
 		return errutil.Wrap(err, "failed to save file")

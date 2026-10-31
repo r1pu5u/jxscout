@@ -14,6 +14,7 @@ import (
 
 	"go.uber.org/ratelimit"
 
+	"github.com/francisconeves97/jxscout/internal/core/common"
 	"github.com/francisconeves97/jxscout/internal/core/errutil"
 )
 
@@ -99,6 +100,9 @@ func (s *assetFetcherImpl) RateLimitedGet(ctx context.Context, url string, heade
 
 // Get is a regular HTTP get but handles GZIP and adds headers to avoid being detected as bot.
 func (s *assetFetcherImpl) Get(ctx context.Context, url string, headers map[string]string) (string, bool, error) {
+	if common.IsCaptureNoise(url) {
+		return "", false, nil
+	}
 	if s.allowedURL != nil && !s.allowedURL(url) {
 		return "", false, fmt.Errorf("URL outside configured scope")
 	}

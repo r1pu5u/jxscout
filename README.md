@@ -1,23 +1,27 @@
 # JXScout
 
-JXScout captures and analyzes JavaScript for security research through Burp or
-Caido. This fork adds local project workspaces, recursive discovery of hidden
-hashed chunks, and automatic webcrack processing to the proxy workflow.
+Capture JavaScript through Burp Suite or Caido, discover hidden chunks, and inspect
+static analysis results. Initialize a project in your target directory, run
+`jxscout serve`, and browse the target through your proxy.
+
+![JXScout dashboard showing captured scripts, discovered chunks, analysis counts, and project scope](docs/screenshots/dashboard.png)
+
+*Dashboard preview rendered by the application with example data.*
 
 ## Features
 
-- **Local workspaces:** initialize a target directory and keep its settings and output in `./jxscout/`.
-- **Automatic chunk discovery:** reconstruct filenames from ID/name/hash tables, runtime builders, encoded constant tables, and observed filename templates in captured JavaScript.
-- **Recursive coverage:** follow imports, HTML scripts, preload hints, dependency tables, and newly discovered chunks from proxy traffic.
-- **Webcrack integration:** deobfuscate and unpack JavaScript, then analyze recovered files for findings and additional chunks.
-- **Agent output:** query assets, candidates, findings, and runs using JSON or JSONL.
-- **Proxy capture:** retain Burp/Caido ingestion, source-map recovery, beautification, overrides, and the VSCode integration.
+- **Automatic chunk discovery:** find imports, precache manifest URLs, Webpack runtime builders, and hidden ID/hash tables. Discovered scripts enter the same recursive pipeline.
+- **Validated downloads:** candidate responses must succeed and pass a JavaScript parser before they are saved. HTML fallbacks, JSON, CSS, and malformed scripts are rejected.
+- **Discovery on capture and restart:** process scripts without waiting for formatting, resume from saved project files, and restore missing discovered files.
+- **Named local projects:** remember each project's output folder and scope; switch projects without changing the Burp listener's host or port.
+- **In-place formatting:** use Webcrack or Prettier on the same `.js` file, without raw snapshots, `.webcrack` folders, or bundle extraction.
+- **Analysis you can inspect:** view matches and source locations in the dashboard, or query assets, discovery outcomes, and findings as JSON/JSONL.
 
 ## Install
 
-Building requires Go 1.23.2 or newer and Bun. Bun is also required at runtime.
-Proxy beautification requires Prettier. Webcrack is optional by default and requires
-a supported Node.js version; the current release supports Node.js 22 or 24.
+Build dependencies: Go 1.23.2 or newer and Bun. Bun is required at runtime;
+Prettier provides formatting, and optional Webcrack requires a supported Node.js
+version.
 
 ```sh
 git clone https://github.com/r1pu5u/jxscout.git
@@ -26,153 +30,154 @@ bun install --frozen-lockfile
 bun run scripts/build-agent-cli.ts
 go install ./cmd/jxscout
 
-# Install processing tools separately if needed.
 bun install -g prettier
 npm install -g webcrack
-
 jxscout doctor --format json
 ```
 
-`go install` puts the executable in `GOBIN`, or `$(go env GOPATH)/bin` when `GOBIN`
-is unset. Add that directory to your PATH. To build a repository-local executable,
-use `go build -o jxscout ./cmd/jxscout` instead.
+The executable is installed in `GOBIN`, or `$(go env GOPATH)/bin` when `GOBIN` is
+unset. Add that directory to your PATH. Use `make build` to rebuild all embedded
+JavaScript processors after changing their sources.
 
-Use `make build` when rebuilding all embedded JavaScript processors after changing
-their source. The install commands above rebuild the agent CLI and chunk
-processor and use the checked-in AST and source-map processors.
+## Initialize a project
 
-## Capture with Burp
-
-Initialize the project from the target directory. Give it a project name and one
-or more JXScout scope patterns:
+Run `init` in the directory where you want the project's output:
 
 ```sh
-cd ~/target/lippo
-jxscout init --project lippo \
-  --scope '*lippo*' \
-  --scope '*cdn.example.net*'
-```
-
-`init` is setup-only: it creates `~/target/lippo/jxscout/` and saves project
-settings there. Commands run from the target directory or any subdirectory reuse
-those settings. Repeat `--scope` for additional patterns; use `init --force` to
-update an existing workspace. Quote wildcard patterns so your shell does not
-expand `*`.
-
-Start the capture listener from the target directory or any subdirectory and
-leave it running while browsing through Burp:
-
-```sh
+mkdir -p ~/target/example.com
+cd ~/target/example.com
+jxscout init --project example.com \
+  --scope '*.example.com/*' \
+  --scope 'https://example.com/*'
 jxscout serve
 ```
 
-The listener defaults to `localhost:3333`. In the JXScout Burp extension, set
-**Server Host** to `localhost` and **Server Port** to `3333`, click **Save**, and
-check **Filter In-Scope**. Configure the target scope separately in Burp's
-Target scope settings; JXScout's local scope patterns do not configure Burp's
-scope for you.
+This registers `example.com` with output at `~/target/example.com/jxscout`.
+`init` creates the configuration; downloads begin when `serve` receives traffic
+or resumes discovery from saved scripts.
 
-As Burp forwards traffic, `serve` captures responses, stores the original files,
-and automatically analyzes JavaScript and follows discovered chunks. Webcrack
-output and source-map recovery feed into analysis and further chunk discovery.
-Use Ctrl-C to stop the listener.
-
-Inspect the captured results from the workspace:
+You can select the initialized project from any directory:
 
 ```sh
-jxscout assets --format json
-jxscout chunks --format json
-jxscout findings --search fetch --format json
-jxscout runs --format json
+jxscout serve --project example.com
 ```
 
-JXScout's scope patterns control its own capture processing. They are separate
-from Burp's Target scope and the extension's **Filter In-Scope** setting.
+`-p` and `--project-name` are aliases for `--project`. Repeat `--scope` to add
+patterns. Use `init --force` with the complete scope list to update an existing
+workspace; explicit `serve --scope` flags override scope for that invocation.
+Project records are stored in `~/.config/jxscout/projects.json`.
+
+Scope patterns match **full URLs**, including paths and queries. They are not
+domain-only filters. For example, `*.example.com/*` covers subdomains but excludes
+the bare `example.com` host, so the example above includes a second pattern.
+Quote patterns to prevent shell expansion.
+
+## Connect Burp or Caido
+
+Install the [Burp extension](https://github.com/francisconeves97/jxscout-burp) or
+[Caido plugin](https://github.com/francisconeves97/jxscout-caido).
+
+For Burp, set **Server Host** to `localhost` and **Server Port** to `3333` in the
+JXScout extension, then click **Save**. Configure Burp's Target scope separately
+when using the extension's **Filter In-Scope** option. JXScout's scope patterns
+do not change Burp's settings.
+
+Browse your target through the proxy. Disable browser caching so scripts pass
+through the proxy. JXScout saves scripts, discovers candidate chunks, validates
+responses, and downloads valid JavaScript automatically within its scope.
+It skips known Cloudflare challenge paths and icons, and parses HTML in memory
+to find scripts rather than saving page copies.
+
+## Dashboard
+
+`jxscout serve` opens the terminal dashboard. Use number keys or Tab to navigate:
+
+| View | What it shows |
+| --- | --- |
+| **1 Capture** | Recent scripts, discovered chunks, saved-file counts, and analysis-match counts |
+| **2 Projects** | Initialized projects, output folders, and scope; Enter switches project |
+| **3 Scope** | URL patterns; **a** adds, **Enter** saves, **Delete** removes the selected pattern |
+| **4 Activity** | Processing logs; **s** toggles following, **c** clears the log buffer |
+| **5 Findings** | Static analysis matches, analyzer categories, code snippets, and file locations |
+
+F2–F5 also open the corresponding views. Press **:** for commands and **Esc** to
+cancel an edit or return to capture. Command output scrolls with the arrow keys.
+Ctrl+C stops the listener. Existing commands such as `config`, `logs`, and Caido
+overrides remain available. Analysis matches are review leads, not confirmed
+vulnerabilities.
+
+Switching projects restores the selected project's scope and output folder while
+keeping the listener host and port. Interactive scope changes are saved.
+
+```text
+project example.com
+scope add *.cdn.example.com/*
+scope remove *.cdn.example.com/*
+```
+
+For agents and scripts, run the same listener without the dashboard:
+
+```sh
+jxscout serve --project example.com --headless
+jxscout assets --project example.com --format json
+jxscout chunks --project example.com --format json
+jxscout findings --project example.com --search fetch --format json
+```
+
+Chunk queries include recorded outcomes such as `fetching`, `downloaded`,
+`not_found`, `invalid_js`, and `error`. Duplicate candidate URLs are suppressed
+across scripts.
+
+## Output and formatting
+
+```text
+~/target/example.com/jxscout/
+├── config.json
+├── original/
+│   └── www.example.com/
+│       └── assets/
+│           ├── app.7cb1a320.js
+│           └── 827.83f2b972.js
+└── .state/
+    └── example.com/             # Databases, settings, and logs
+```
+
+Webcrack formats JavaScript **in place**, with module extraction disabled. It does
+not create `raw/` or `.webcrack` folders. Extensionless script URLs are saved with
+a `.js` extension. Source-map recovery remains available separately, alongside
+the [VSCode integration](https://github.com/francisconeves97/jxscout-vscode).
+
+| Mode | Behavior |
+| --- | --- |
+| `--webcrack auto` | Use Webcrack when available; fall back to Prettier if needed |
+| `--webcrack off` | Use Prettier only |
+| `--webcrack required` | Require Webcrack and report formatting failures |
+
+Chunk discovery runs independently of formatting, and saved scripts are revisited
+when `serve` starts. Supplied credentials are not forwarded to other origins;
+scope is also checked on redirect targets.
 
 ## Optional local analysis
 
-`analyze` processes JavaScript, HTML, or directories already on disk. It is useful
-for reviewing saved files; it does not replace proxy capture or capture traffic.
+Process files already on disk without proxy capture:
 
 ```sh
-jxscout analyze ./downloaded-js --webcrack required --format json
+jxscout analyze ./downloaded-js --webcrack auto --format json
+jxscout runs --format json
 ```
 
-Local analysis follows local dependencies. Fetching remote references requires
-`--fetch`, and configured JXScout scope patterns still apply to remote requests.
-Source-map comments and inline maps with `sourcesContent` are supported. Use
-`jxscout analyze --help` for options.
+Local analysis follows local dependencies. Remote requests require `--fetch` and
+still obey scope. Explicit source-map comments and inline maps containing
+`sourcesContent` are supported. Query results support `--search`, `--page`, and
+`--page-size`; local runs can be filtered with `--run`.
 
-## Proxy capture and terminal interface
+Text is the default output format. JSON emits a versioned result; JSONL emits
+progress records followed by a summary. Diagnostics go to stderr. Exit codes are
+`0` for completion, `1` for invalid input or fatal errors, `2` for partial results,
+and `130` for interruption.
 
-```sh
-# Run the same capture listener without a terminal UI; stop with Ctrl-C.
-jxscout serve
-
-# Open the compact interactive terminal interface.
-jxscout tui
-
-# Override the project or server port for this invocation.
-jxscout serve --project another-project -port 3333
-```
-
-The Burp extension setup above forwards traffic to the listener, which defaults to
-`localhost:3333`. JXScout also supports these integrations:
-
-- [Burp plugin](https://github.com/francisconeves97/jxscout-burp)
-- [Caido plugin](https://github.com/francisconeves97/jxscout-caido)
-- [VSCode extension](https://github.com/francisconeves97/jxscout-vscode)
-
-Disable browser caching when relying on proxy capture so requests pass through the
-proxy. Captured JavaScript feeds chunk discovery automatically. Webcrack runs after
-beautification; recovered files feed into AST analysis and chunk discovery.
-Existing terminal commands, including `config`, `logs`, and Caido overrides,
-remain available inside `tui`.
-
-Running `jxscout` without arguments displays help. Legacy launch flags still open
-the interactive capture interface. Use `jxscout serve -h` for listener and proxy
-processing flags, or `jxscout analyze --help` for local-file analysis options.
-
-## Output and automation
-
-Inside an initialized workspace:
-
-```text
-jxscout/
-  config.json                 Project name and scope
-  original/                   Proxy working files
-  raw/                        Immutable proxy capture snapshots
-  original/path/to/file.js.webcrack/  Recovered JavaScript beside its source
-  .state/PROJECT/              SQLite databases, capture settings, and logs
-```
-
-Proxy source-map recovery and webcrack output are written as those stages run.
-Local `analyze` also supports explicit source-map comments and inline maps with
-`sourcesContent`; proxy capture retains its additional map probes.
-
-Without a workspace, output defaults to `~/jxscout/PROJECT/`, with state under
-`~/.jxscout/PROJECT/`. `--data-dir` overrides local analysis storage;
-`JXSCOUT_DATA_DIR` provides a storage override shared with proxy capture.
-
-| Option                   | Behavior                                         |
-| ------------------------ | ------------------------------------------------ |
-| `--format text`          | Human-readable output; the default               |
-| `--format json`          | One versioned summary or query result            |
-| `--format jsonl`         | Versioned progress records followed by a summary |
-| `--run ID`               | Filter saved results by run                      |
-| `--page N --page-size N` | Paginate query results                           |
-| `--header 'Name: value'` | Repeatable headers for optional remote fetches   |
-| `--public-path URL`      | Override the base for local analysis references  |
-| `--max-assets N`         | Limit local analysis inputs; defaults to 10000   |
-
-Diagnostics go to stderr. Exit codes are `0` for completion, `1` for invalid input
-or fatal errors, `2` for partial results, and `130` for interruption. HTTP and chunk
-discovery timeouts are 30 seconds; webcrack has a 120-second timeout. Partial results
-remain queryable. Supplied credentials are not forwarded to other origins, and
-scope is checked on redirect targets.
-
-Query commands also include existing proxy assets and analysis when no run filter
-is supplied; proxy rows are labeled `source: proxy`.
+See [the CLI guide](docs/agent-cli.md) for more options and
+[the analysis tree reference](docs/tree.md) for the VSCode hierarchy.
 
 ## Development
 
@@ -181,19 +186,11 @@ bun install --frozen-lockfile
 make build
 go build -o jxscout ./cmd/jxscout
 go test ./...
-
-# Include compiled CLI and proxy workspace integration tests.
 JXSCOUT_TEST_BINARY="$PWD/jxscout" bun run vitest run
 ```
 
-See [the agent CLI guide](docs/agent-cli.md) for additional details and
-[the analysis tree reference](docs/tree.md) for the VSCode result hierarchy.
+## Upstream and license
 
-## Upstream
-
-This fork is based on [francisconeves97/jxscout](https://github.com/francisconeves97/jxscout).
-The original open-source version is no longer maintained by its original author;
-[JXScout Pro](https://jxscout.app/) is a separate product. The JS Deep-style
-filename-template approach informed the additional hidden chunk discovery in this fork.
-
-See [COPYING](COPYING) for the license.
+Based on [francisconeves97/jxscout](https://github.com/francisconeves97/jxscout).
+The JS Deep-style filename-template approach informed this fork's additional
+hidden chunk discovery. See [COPYING](COPYING) for the license.

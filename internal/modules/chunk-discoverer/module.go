@@ -18,7 +18,7 @@ import (
 	"github.com/francisconeves97/jxscout/internal/core/common"
 	"github.com/francisconeves97/jxscout/internal/core/dbeventbus"
 	"github.com/francisconeves97/jxscout/internal/core/errutil"
-	"github.com/francisconeves97/jxscout/internal/modules/webcrack"
+	"github.com/francisconeves97/jxscout/internal/modules/beautifier"
 	jxscouttypes "github.com/francisconeves97/jxscout/pkg/types"
 )
 
@@ -29,6 +29,9 @@ type chunkDiscovererModule struct {
 	sdk                       *jxscouttypes.ModuleSDK
 	concurrency               int
 	chunkDiscovererBinaryPath string
+	fetchSlots                chan struct{}
+	claimed                   sync.Map
+	processed                 sync.Map
 }
 
 func NewChunkDiscovererModule(concurrency int, chunkBruteForceLimit int) *chunkDiscovererModule {
@@ -39,13 +42,13 @@ func NewChunkDiscovererModule(concurrency int, chunkBruteForceLimit int) *chunkD
 
 func (m *chunkDiscovererModule) Initialize(sdk *jxscouttypes.ModuleSDK) error {
 	m.sdk = sdk
-
-	go func() {
-		err := m.subscribeAssetSavedEvent()
-		if err != nil {
-			m.sdk.Logger.Error("failed to subscribe to asset saved topic", "err", err)
-		}
-	}()
+	m.fetchSlots = make(chan struct{}, max(1, m.concurrency))
+	if _, err := sdk.Database.Exec(`CREATE TABLE IF NOT EXISTS chunk_discoveries (
+ project TEXT NOT NULL, url TEXT NOT NULL, source_asset_id INTEGER NOT NULL,
+ status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+ PRIMARY KEY(project,url))`); err != nil {
+		return err
+	}
 
 	saveDir := filepath.Join(common.GetPrivateDirectoryRoot(), "extracted")
 
@@ -61,19 +64,22 @@ func (m *chunkDiscovererModule) Initialize(sdk *jxscouttypes.ModuleSDK) error {
 	}
 
 	m.chunkDiscovererBinaryPath = binaryPath
-	sdk.DBEventBus.Subscribe(sdk.Ctx, webcrack.TopicArtifactSaved, "chunkdiscoverer-webcrack", func(ctx context.Context, payload []byte) error {
-		var event webcrack.EventArtifactSaved
-		if err := json.Unmarshal(payload, &event); err != nil {
-			return err
-		}
-		asset, err := sdk.AssetService.GetAssetByID(ctx, event.AssetID)
-		if err != nil {
-			return err
-		}
-		asset.Path = event.Path
-		return m.discoverPossibleChunks(ctx, asset)
-	}, dbeventbus.Options{Concurrency: m.concurrency, MaxRetries: 1, Backoff: common.ExponentialBackoff, PollInterval: time.Second, HeartbeatInterval: 10 * time.Second})
 
+	if err := m.subscribeAssetSavedEvent(); err != nil {
+		return err
+	}
+	// Resume from saved JavaScript even when no new Burp traffic arrives.
+	var assets []struct {
+		ID int64 `db:"id"`
+	}
+	if err := sdk.Database.SelectContext(sdk.Ctx, &assets, "SELECT id FROM assets WHERE project=? AND content_type='JS' AND fs_path!=''", sdk.Options.ProjectName); err != nil {
+		return err
+	}
+	for _, asset := range assets {
+		if err := sdk.DBEventBus.Publish(sdk.Ctx, sdk.Database, "chunkdiscovery.resume", assetservice.EventAssetSaved{AssetID: asset.ID}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -82,36 +88,26 @@ var validChunkDiscovererContentTypes = map[common.ContentType]bool{
 }
 
 func (m *chunkDiscovererModule) subscribeAssetSavedEvent() error {
-	err := m.sdk.DBEventBus.Subscribe(m.sdk.Ctx, assetservice.TopicAssetSaved, "chunkdiscoverer", func(ctx context.Context, payload []byte) error {
-		// unmarshal payload
+	handler := func(ctx context.Context, payload []byte) error {
 		var event assetservice.EventAssetSaved
-		err := json.Unmarshal(payload, &event)
-		if err != nil {
-			return errutil.Wrap(err, "failed to unmarshal payload")
+		if err := json.Unmarshal(payload, &event); err != nil {
+			return err
 		}
-
 		asset, err := m.sdk.AssetService.GetAssetByID(ctx, event.AssetID)
 		if err != nil {
-			return dbeventbus.NewRetriableError(errutil.Wrap(err, "failed to get asset"))
+			return dbeventbus.NewRetriableError(err)
 		}
-
-		err = m.handleAssetSavedEvent(ctx, asset)
-		if err != nil {
-			return errutil.Wrapf(err, "failed to handle asset saved event for asset (%s)", asset.URL)
-		}
-
-		return nil
-	}, dbeventbus.Options{
-		Concurrency:       m.concurrency,
-		MaxRetries:        3,
-		Backoff:           common.ExponentialBackoff,
-		PollInterval:      1 * time.Second,
-		HeartbeatInterval: 10 * time.Second,
-	})
-	if err != nil {
-		return errutil.Wrap(err, "failed to subscribe to ingestion request topic")
+		return m.handleAssetSavedEvent(ctx, asset)
 	}
-
+	for _, subscription := range []struct{ topic, name string }{
+		{assetservice.TopicAssetSaved, "chunkdiscoverer-active-v3"},
+		{beautifier.TopicBeautifierAssetSaved, "chunkdiscoverer-formatted-v3"},
+		{"chunkdiscovery.resume", "chunkdiscoverer-resume-v3"},
+	} {
+		if err := m.sdk.DBEventBus.Subscribe(m.sdk.Ctx, subscription.topic, subscription.name, handler, dbeventbus.Options{Concurrency: max(1, m.concurrency), MaxRetries: 3, Backoff: common.ExponentialBackoff, PollInterval: time.Second, HeartbeatInterval: 10 * time.Second}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -125,9 +121,18 @@ func (m *chunkDiscovererModule) handleAssetSavedEvent(ctx context.Context, asset
 }
 
 func (s *chunkDiscovererModule) discoverPossibleChunks(ctx context.Context, asset assetservice.Asset) error {
-	chunksRaw, err := s.execChunkDiscoverer(ctx, asset)
+	source, err := os.ReadFile(asset.Path)
 	if err != nil {
-		return errutil.Wrap(err, "failed to exec chunk discoverer")
+		return dbeventbus.NewRetriableError(err)
+	}
+	key := asset.URL + "\x00" + common.Hash(string(source))
+	if _, duplicate := s.processed.LoadOrStore(key, true); duplicate {
+		return nil
+	}
+	chunksRaw, err := s.execChunkDiscoverer(ctx, asset, source)
+	if err != nil {
+		s.processed.Delete(key)
+		return dbeventbus.NewRetriableError(err)
 	}
 
 	chunks := []string{}
@@ -141,71 +146,71 @@ func (s *chunkDiscovererModule) discoverPossibleChunks(ctx context.Context, asse
 		return errutil.Wrap(err, "failed to parse original url")
 	}
 
-	seen := map[string]bool{}
-	for _, chunk := range chunksRaw {
-		ref, err := url.Parse(strings.TrimSpace(chunk))
-		if err != nil {
-			continue
-		}
-		resolved := parsedURL.ResolveReference(ref)
-		if resolved.Scheme != "https" && resolved.Scheme != "http" {
-			continue
-		}
-		resolved.Fragment = ""
-		target := resolved.String()
-		if target == asset.URL || seen[target] || !s.sdk.Scope.IsInScope(target) {
-			continue
-		}
-		seen[target] = true
-		chunks = append(chunks, target)
-	}
+	chunks = resolveCandidates(parsedURL, asset.URL, chunksRaw, s.sdk.Scope.IsInScope)
 
 	if len(chunks) > 0 {
-		s.sdk.Logger.Info("discovered possible chunks 🔎", "chunks", chunks, "asset_url", asset.URL)
+		s.sdk.Logger.Info("chunk candidates", "count", len(chunks), "asset_url", asset.URL)
 	}
 	wg := &sync.WaitGroup{}
-	sem := make(chan struct{}, s.concurrency)
-
-	for _, chunk := range chunks {
+	for _, chunkURL := range chunks {
+		if common.IsCaptureNoise(chunkURL) {
+			continue
+		}
+		if _, duplicate := s.claimed.LoadOrStore(chunkURL, true); duplicate {
+			continue
+		}
+		// Previously captured URLs need no additional network request.
+		if saved, exists, err := s.sdk.AssetService.GetAssetByURL(ctx, chunkURL); err == nil && exists {
+			if info, statErr := os.Stat(saved.Path); statErr == nil && info.Mode().IsRegular() {
+				status := "existing"
+				if saved.IsChunkDiscovered != nil && *saved.IsChunkDiscovered {
+					status = "downloaded"
+				}
+				s.recordDiscovery(ctx, asset.ID, chunkURL, status, "")
+				continue
+			}
+		}
+		select {
+		case s.fetchSlots <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		wg.Add(1)
-		sem <- struct{}{} // Acquire semaphore
 		go func(chunkURL string) {
 			defer wg.Done()
-			defer func() { <-sem }() // Release semaphore
-
+			defer func() { <-s.fetchSlots }()
+			s.recordDiscovery(ctx, asset.ID, chunkURL, "fetching", "")
 			headers := asset.RequestHeaders
 			target, _ := url.Parse(chunkURL)
 			if target.Scheme != parsedURL.Scheme || target.Host != parsedURL.Host {
 				headers = nil
 			}
-			content, found, err := s.sdk.AssetFetcher.RateLimitedGet(ctx, chunkURL, headers)
+			requestCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			content, found, err := s.sdk.AssetFetcher.RateLimitedGet(requestCtx, chunkURL, headers)
 			if err != nil {
-				s.sdk.Logger.Error("failed to perform get request", "err", err)
+				s.recordDiscovery(ctx, asset.ID, chunkURL, "error", err.Error())
+				s.sdk.Logger.Debug("chunk fetch failed", "url", chunkURL, "err", err)
 				return
 			}
 			if !found || common.IsProbablyHTML([]byte(content)) {
-				s.sdk.Logger.Debug("asset not found", "asset_url", chunkURL)
+				s.recordDiscovery(ctx, asset.ID, chunkURL, "not_found", "not JavaScript or HTTP non-200")
 				return
 			}
-
-			asset := assetservice.Asset{
-				URL:               chunkURL,
-				ContentType:       common.ContentTypeJS,
-				Content:           &content,
-				Project:           s.sdk.Options.ProjectName,
-				RequestHeaders:    asset.RequestHeaders,
-				IsChunkDiscovered: common.ToPtr(true),
-				ChunkFromAssetID:  &asset.ID,
+			valid, err := s.validateJavaScript(ctx, content)
+			if err != nil {
+				s.recordDiscovery(ctx, asset.ID, chunkURL, "error", err.Error())
+				return
 			}
-
-			if common.StrPtr(asset.GetParentURL()) != "" {
-				asset.Parent = &assetservice.Asset{
-					URL: *asset.GetParentURL(),
-				}
+			if !valid {
+				s.recordDiscovery(ctx, asset.ID, chunkURL, "invalid_js", "HTTP 200 response is not a valid JavaScript program")
+				return
 			}
-
-			s.sdk.AssetService.AsyncSaveAsset(ctx, &asset)
-		}(chunk)
+			discovered := assetservice.Asset{URL: chunkURL, ContentType: common.ContentTypeJS, Content: &content, Project: s.sdk.Options.ProjectName, RequestHeaders: headers, IsChunkDiscovered: common.ToPtr(true), ChunkFromAssetID: &asset.ID, Parent: &assetservice.Asset{URL: asset.URL}}
+			s.sdk.AssetService.AsyncSaveAsset(ctx, &discovered)
+			s.recordDiscovery(ctx, asset.ID, chunkURL, "downloaded", "")
+			s.sdk.Logger.Info("downloaded discovered chunk", "url", chunkURL)
+		}(chunkURL)
 	}
 
 	wg.Wait()
@@ -213,15 +218,16 @@ func (s *chunkDiscovererModule) discoverPossibleChunks(ctx context.Context, asse
 	return nil
 }
 
-func (s *chunkDiscovererModule) execChunkDiscoverer(ctx context.Context, asset assetservice.Asset) ([]string, error) {
+func (s *chunkDiscovererModule) execChunkDiscoverer(ctx context.Context, asset assetservice.Asset, source []byte) ([]string, error) {
 	var urls []string
 	_ = s.sdk.Database.SelectContext(ctx, &urls, "SELECT url FROM assets WHERE project = ?", s.sdk.Options.ProjectName)
 	seeds, _ := json.Marshal(urls)
 	// Prepare the command to run the JavaScript script with Bun
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bun", "run", s.chunkDiscovererBinaryPath, asset.Path, fmt.Sprintf("%d", s.sdk.Options.ChunkDiscovererBruteForceLimit), string(seeds))
+	cmd := exec.CommandContext(ctx, "bun", "run", s.chunkDiscovererBinaryPath, "--stdin", fmt.Sprintf("%d", s.sdk.Options.ChunkDiscovererBruteForceLimit), string(seeds))
 
+	cmd.Stdin = bytes.NewReader(source)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	output, err := cmd.Output()
@@ -232,4 +238,73 @@ func (s *chunkDiscovererModule) execChunkDiscoverer(ctx context.Context, asset a
 		return nil, nil
 	}
 	return strings.Split(strings.TrimSpace(string(output)), "\n"), nil
+}
+
+func (s *chunkDiscovererModule) recordDiscovery(ctx context.Context, source int64, url, status, detail string) {
+	_, err := s.sdk.Database.ExecContext(ctx, `INSERT INTO chunk_discoveries(project,url,source_asset_id,status,detail) VALUES(?,?,?,?,?) ON CONFLICT(project,url) DO UPDATE SET status=excluded.status,detail=excluded.detail,updated_at=CURRENT_TIMESTAMP`, s.sdk.Options.ProjectName, url, source, status, detail)
+	if err != nil && ctx.Err() == nil {
+		s.sdk.Logger.Warn("could not record chunk status", "err", err)
+	}
+}
+
+func resolveCandidates(parsedURL *url.URL, sourceURL string, raw []string, allowed func(string) bool) []string {
+	chunks := []string{}
+	explicit := map[string]bool{}
+	for _, candidate := range raw {
+		ref, err := url.Parse(strings.TrimSpace(candidate))
+		if err != nil {
+			continue
+		}
+		if ref.IsAbs() || strings.HasPrefix(ref.Path, "/") {
+			explicit[parsedURL.ResolveReference(ref).String()] = true
+		}
+	}
+	seen := map[string]bool{}
+	for _, chunk := range raw {
+		ref, err := url.Parse(strings.TrimSpace(chunk))
+		if err != nil {
+			continue
+		}
+		resolved := parsedURL.ResolveReference(ref)
+		if !ref.IsAbs() && !strings.HasPrefix(ref.Path, "/") {
+			fromRoot := *ref
+			fromRoot.Path = "/" + ref.Path
+			rootTarget := parsedURL.ResolveReference(&fromRoot)
+			if explicit[rootTarget.String()] {
+				resolved = rootTarget
+			}
+		}
+		if resolved.Scheme != "https" && resolved.Scheme != "http" {
+			continue
+		}
+		resolved.Fragment = ""
+		target := resolved.String()
+		if target == sourceURL || seen[target] || !allowed(target) {
+			continue
+		}
+		seen[target] = true
+		chunks = append(chunks, target)
+	}
+
+	return chunks
+}
+
+func (s *chunkDiscovererModule) validateJavaScript(ctx context.Context, source string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bun", s.chunkDiscovererBinaryPath, "--validate")
+	cmd.Stdin = strings.NewReader(source)
+	var diagnostics bytes.Buffer
+	cmd.Stderr = &diagnostics
+	output, err := cmd.Output()
+	if err != nil {
+		return false, fmt.Errorf("JavaScript validation: %w: %.1000s", err, diagnostics.String())
+	}
+	var result struct {
+		Valid bool `json:"valid"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		return false, err
+	}
+	return result.Valid, nil
 }

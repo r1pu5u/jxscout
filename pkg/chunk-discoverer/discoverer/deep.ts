@@ -1,5 +1,5 @@
 import { parse } from "acorn-loose";
-import { simple, full } from "acorn-walk";
+import { simple, full, fullAncestor } from "acorn-walk";
 
 export interface Candidate {
   specifier: string;
@@ -13,6 +13,7 @@ export function inferTemplate(raw: string): string | undefined {
     const u = new URL(raw);
     const match = u.pathname.match(/^(.*\/)([^/]+)\.(m?js)$/);
     if (!match) return;
+    if (/^(?:precache-manifest|service-worker|sw)[.-]/i.test(match[2])) return;
     const parts = match[2].split(/([.-])/);
     let hash = parts.findIndex(
       (p) => /^[a-f\d]{8,64}$/i.test(p) && /[a-f]/i.test(p),
@@ -27,6 +28,12 @@ export function inferTemplate(raw: string): string | undefined {
         .slice(0, hash)
         .findLastIndex((p) => p !== "." && p !== "-" && p !== "");
     if (hash < 0 || id < 0) return;
+    if (!/^\d+$/.test(parts[id])) {
+      // Named webpack IDs include prefixes such as chunk- or SS_.
+      return new URL(match[1] + "{id}.{hash}." + match[3] + u.search, u).href
+        .replaceAll("%7B", "{")
+        .replaceAll("%7D", "}");
+    }
     parts[id] = "{id}";
     parts[hash] = "{hash}";
     u.pathname = match[1] + parts.join("") + "." + match[3];
@@ -34,6 +41,30 @@ export function inferTemplate(raw: string): string | undefined {
   } catch {
     return;
   }
+}
+
+function isChunkHash(value: unknown): value is string {
+  // Inferred filenames need strong evidence. Non-hex names remain supported
+  // through explicit imports/manifests and evaluated runtime builders.
+  return typeof value === "string" && /^[a-f\d]{8,64}$/i.test(value);
+}
+function isManifestRecord(node: any): boolean {
+  return (
+    node?.type === "ObjectExpression" &&
+    node.properties.some(
+      (p: any) =>
+        p.type === "Property" &&
+        ["url", "revision"].includes(String(p.key.name ?? p.key.value)),
+    )
+  );
+}
+function fromTemplate(template: string, id: string, hash: string): string {
+  // A named chunk key already includes webpack's `chunk-` prefix.
+  if (/chunk-\{id\}/.test(template) && id.startsWith("chunk-"))
+    id = id.slice(6);
+  return template
+    .replaceAll("{id}", encodeURIComponent(id))
+    .replaceAll("{hash}", encodeURIComponent(hash));
 }
 
 // Deliberately interprets only constant expressions, never the target program.
@@ -44,13 +75,25 @@ export function deepDiscover(
   unresolved: { expression: string; start: number }[] = [],
 ): Candidate[] {
   const ast: any = parse(code, { ecmaVersion: "latest", sourceType: "module" });
+  const cssMaps = new Set<number>();
+  fullAncestor(ast, (n: any, _state: any, parents: any[]) => {
+    if (n.type !== "ObjectExpression") return;
+    if (
+      parents.some(
+        (p) =>
+          p.type === "BinaryExpression" &&
+          /["']\.css["']/.test(code.slice(p.start, p.end)),
+      )
+    )
+      cssMaps.add(n.start);
+  });
   const bindings = new Map<string, any>();
   const ids = new Set<string>();
   const candidates: Candidate[] = [];
   const add = (value: any, method: string, node: any, extra = {}) => {
     if (
       typeof value === "string" &&
-      /\.(?:m?js|cjs)(?:[?#].*)?$/.test(value) &&
+      /(?:^|\/)[^/?#]+\.(?:m?js|cjs)(?:[?#].*)?$/.test(value) &&
       !/[\n\r\0]/.test(value)
     )
       candidates.push({
@@ -64,7 +107,7 @@ export function deepDiscover(
     if (n.type === "FunctionDeclaration" && n.id) bindings.set(n.id.name, n);
     if (n.type === "VariableDeclarator" && n.id.type === "Identifier")
       bindings.set(n.id.name, n.init);
-    if (n.type === "Property" && !n.computed)
+    if (n.type === "Property" && !n.computed && isChunkHash(n.value?.value))
       ids.add(String(n.key.name ?? n.key.value));
     if (
       n.type === "CallExpression" &&
@@ -75,6 +118,7 @@ export function deepDiscover(
       ids.add(String(n.arguments[0].value));
   });
   const unknown = Symbol("unknown");
+  const publicPaths = new Map<string, string>();
   function evaluate(n: any, env = new Map<string, any>(), depth = 0): any {
     try {
       return evaluateNode(n, env, depth);
@@ -102,8 +146,11 @@ export function deepDiscover(
       case "ArrayExpression":
         return n.elements.map(ev);
       case "MemberExpression": {
-        const obj = ev(n.object),
-          key = n.computed ? ev(n.property) : n.property.name;
+        const key = n.computed ? ev(n.property) : n.property.name;
+        const receiver = code.slice(n.object.start, n.object.end);
+        if (key === "p" && publicPaths.has(receiver))
+          return publicPaths.get(receiver);
+        const obj = ev(n.object);
         return obj !== unknown &&
           obj != null &&
           key !== unknown &&
@@ -202,23 +249,23 @@ export function deepDiscover(
       value &&
       value !== unknown &&
       typeof value === "object" &&
-      !Array.isArray(value)
+      !Array.isArray(value) &&
+      !Object.hasOwn(value, "revision") &&
+      !Object.hasOwn(value, "url") &&
+      !cssMaps.has(node.start)
     )
       for (const [id, hash] of Object.entries(value)) {
         ids.add(id);
-        if (typeof hash === "string" && /^[a-z\d_-]{6,64}$/i.test(hash))
+        if (isChunkHash(hash))
           for (const template of templates)
             add(
-              template
-                .replaceAll("{id}", encodeURIComponent(id))
-                .replaceAll("{hash}", encodeURIComponent(hash)),
+              fromTemplate(template, id, hash),
               "decoded-hash-template",
               node,
               { id, hash },
             );
       }
   }
-  const publicPaths = new Map<string, string>();
   full(ast, (n: any) => {
     if (
       n.type === "AssignmentExpression" &&
@@ -235,6 +282,9 @@ export function deepDiscover(
   });
   full(ast, (n: any) => {
     if (n.type === "ImportExpression") add(evaluate(n.source), "import", n);
+    // Precache manifests store paths in object records, not only string arrays.
+    if (n.type === "Literal" && typeof n.value === "string")
+      add(n.value, "literal-reference", n);
     if (
       [
         "ImportDeclaration",
@@ -246,19 +296,23 @@ export function deepDiscover(
       add(evaluate(n.source), "import", n);
     if (n.type === "ArrayExpression")
       for (const e of n.elements) add(evaluate(e), "manifest", e ?? n);
-    if (n.type === "Property") {
-      const id = String(n.key.name ?? n.key.value),
-        hash = evaluate(n.value);
-      if (typeof hash === "string" && /^[a-z\d_-]{6,64}$/i.test(hash))
-        for (const template of templates)
-          add(
-            template
-              .replaceAll("{id}", encodeURIComponent(id))
-              .replaceAll("{hash}", encodeURIComponent(hash)),
-            "hash-template",
-            n,
-            { id, hash },
-          );
+    if (
+      n.type === "ObjectExpression" &&
+      !isManifestRecord(n) &&
+      !cssMaps.has(n.start)
+    ) {
+      for (const prop of n.properties) {
+        if (prop.type !== "Property") continue;
+        const n = prop;
+        const id = String(n.key.name ?? n.key.value),
+          hash = evaluate(n.value);
+        if (isChunkHash(hash))
+          for (const template of templates)
+            add(fromTemplate(template, id, hash), "hash-template", n, {
+              id,
+              hash,
+            });
+      }
     }
     if (
       n.type !== "AssignmentExpression" ||

@@ -2,19 +2,16 @@ package tui
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	assetservice "github.com/francisconeves97/jxscout/internal/core/asset-service"
 	"github.com/francisconeves97/jxscout/internal/core/common"
 	"github.com/francisconeves97/jxscout/internal/modules/overrides"
-	"github.com/francisconeves97/jxscout/pkg/constants"
 	jxscouttypes "github.com/francisconeves97/jxscout/pkg/types"
 	"github.com/muesli/reflow/wordwrap"
 )
@@ -38,9 +35,36 @@ type TUI struct {
 	logsPanelViewportReady bool
 	autoScroll             bool
 	jxscout                JXScout
-	hasUpdate              bool
-	latestVersion          string
+	height                 int
+	commandMode            bool
+	editing                bool
+	notice                 string
+	refreshPending         bool
+	assets                 []assetservice.Asset
+	assetTotal             int
+	dataError              string
+	resultViewport         viewport.Model
+	resultContent          string
 	width                  int
+	panel                  string
+	panelIndex             int
+	panelError             string
+	projects               []common.Project
+	findings               []AnalysisMatch
+	findingCount           int
+	findingsRefreshPending bool
+	findingsLastRefresh    time.Time
+	findingsRequestID      uint64
+}
+
+// AnalysisMatch is a static AST analyzer observation, not a confirmed vulnerability.
+type AnalysisMatch struct {
+	AssetPath, Analyzer, Value string
+	Line, Column               int
+}
+
+type analysisResultsSource interface {
+	GetAnalysisMatches(context.Context) ([]AnalysisMatch, error)
 }
 
 type LogBuffer interface {
@@ -61,17 +85,19 @@ type JXScout interface {
 
 func New(jxscout JXScout) *TUI {
 	t := &TUI{
-		input:          textinput.New(),
-		commands:       map[string]Command{},
-		history:        []string{},
-		historyIndex:   -1,
-		logsPanelShown: false,
-		autoScroll:     true,
-		jxscout:        jxscout,
+		input:             textinput.New(),
+		resultViewport:    viewport.New(80, 15),
+		logsPanelViewport: viewport.New(80, 15),
+		commands:          map[string]Command{},
+		history:           []string{},
+		historyIndex:      -1,
+		logsPanelShown:    false,
+		autoScroll:        true,
+		jxscout:           jxscout,
 	}
 	t.input.Prompt = "> "
 	t.input.Placeholder = "Enter command..."
-	t.input.Focus()
+	t.input.Blur()
 	t.RegisterDefaultCommands()
 	return t
 }
@@ -92,46 +118,8 @@ func (t *TUI) addToHistory(cmd string) {
 
 type LogsTickMsg time.Time
 
-type VersionCheckMsg struct {
-	HasUpdate bool
-	Version   string
-}
-
-func versionCheckCmd() tea.Cmd {
-	return func() tea.Msg {
-		// Use curl to check the latest release on GitHub
-		cmd := exec.Command("curl", "-s", "https://api.github.com/repos/francisconeves97/jxscout/releases/latest")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return VersionCheckMsg{HasUpdate: false}
-		}
-
-		// Parse the JSON response to extract the tag_name
-		var response struct {
-			TagName string `json:"tag_name"`
-		}
-		if err := json.Unmarshal(output, &response); err != nil {
-			return VersionCheckMsg{HasUpdate: false}
-		}
-
-		// Remove 'v' prefix if present
-		latestVersion := strings.TrimPrefix(response.TagName, "v")
-		currentVersion := constants.Version
-
-		// Compare versions
-		if latestVersion != currentVersion {
-			return VersionCheckMsg{
-				HasUpdate: true,
-				Version:   latestVersion,
-			}
-		}
-
-		return VersionCheckMsg{HasUpdate: false}
-	}
-}
-
 func (t *TUI) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, logsTickerCmd(), versionCheckCmd())
+	return tea.Batch(textinput.Blink, logsTickerCmd(), t.refreshDashboard(), t.refreshFindings())
 }
 
 func logsTickerCmd() tea.Cmd {
@@ -140,201 +128,221 @@ func logsTickerCmd() tea.Cmd {
 	})
 }
 
-func (t *TUI) handlePromptViewUpdate(msg tea.Msg) tea.Cmd {
-	var (
-		cmd  tea.Cmd
-		cmds []tea.Cmd
-	)
-
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyEnter:
-			command := t.input.Value()
-			if command == "" {
-				return nil
-			}
-
-			t.output = ""
-			t.addToHistory(command)
-
-			cmd, err := t.ExecuteCommand(command)
-			if err != nil {
-				t.writeLineToOutput(fmt.Sprintf("Error: %s", err))
-			}
-
-			cmds = append(cmds, cmd)
-
-			t.input.Reset()
-		case tea.KeyCtrlC:
-			t.output = ""
-			cmd, _ := t.ExecuteCommand("exit")
-			return cmd
-		case tea.KeyUp:
-			if t.historyIndex > 0 {
-				t.historyIndex--
-				t.input.SetValue(t.history[t.historyIndex])
-			}
-		case tea.KeyDown:
-			if t.historyIndex < len(t.history)-1 {
-				t.historyIndex++
-				t.input.SetValue(t.history[t.historyIndex])
-			} else {
-				t.historyIndex = len(t.history)
-				t.input.Reset()
-			}
-		}
-	}
-
-	t.input, cmd = t.input.Update(msg)
-	cmds = append(cmds, cmd)
-
-	return tea.Batch(cmds...)
-}
-
-func (t *TUI) handleLogsViewUpdate(msg tea.Msg) tea.Cmd {
-	var (
-		cmd  tea.Cmd
-		cmds []tea.Cmd
-	)
-
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.Type {
-		case tea.KeyCtrlC, tea.KeyEsc:
-			t.logsPanelShown = false
-		case tea.KeyRunes:
-			switch string(msg.Runes) {
-			case "q":
-				t.logsPanelShown = false
-			case "s":
-				t.autoScroll = !t.autoScroll
-			case "c":
-				t.jxscout.GetLogBuffer().Clear()
-				t.logsPanelViewport.SetContent(wordwrap.String(t.jxscout.GetLogBuffer().String(), t.logsPanelViewport.Width))
-			}
-		}
-	case LogsTickMsg:
-		t.logsPanelViewport.SetContent(wordwrap.String(t.jxscout.GetLogBuffer().String(), t.logsPanelViewport.Width))
-		if t.autoScroll {
-			t.logsPanelViewport.GotoBottom()
-		}
-	}
-
-	t.logsPanelViewport, cmd = t.logsPanelViewport.Update(msg)
-	cmds = append(cmds, cmd)
-
-	return tea.Batch(cmds...)
-}
-
-// Update handles the update of the TUI
 func (t *TUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	var (
-		cmd  tea.Cmd
-		cmds []tea.Cmd
-	)
-
+	var cmds []tea.Cmd
 	switch msg := msg.(type) {
-	case VersionCheckMsg:
-		t.hasUpdate = msg.HasUpdate
-		t.latestVersion = msg.Version
-	case tea.KeyMsg:
 	case tea.WindowSizeMsg:
-		t.width = msg.Width
-		headerHeight := lipgloss.Height(t.logsHeader())
-		footerHeight := lipgloss.Height(t.logsFooter())
-		verticalMarginHeight := headerHeight + footerHeight
-
-		if !t.logsPanelViewportReady {
-			t.logsPanelViewport = viewport.New(msg.Width, msg.Height-verticalMarginHeight)
-			t.logsPanelViewport.SetContent(wordwrap.String(t.jxscout.GetLogBuffer().String(), t.logsPanelViewport.Width))
-			t.logsPanelViewport.YPosition = headerHeight
-			t.logsPanelViewport.Style = lipgloss.NewStyle().
-				Border(lipgloss.NormalBorder()).
-				BorderForeground(lipgloss.Color("62"))
-			t.logsPanelViewportReady = true
-		} else {
-			t.logsPanelViewport.Width = msg.Width
-			t.logsPanelViewport.Height = msg.Height - verticalMarginHeight
+		t.width, t.height = msg.Width, msg.Height
+		t.input.Width = max(4, msg.Width-10)
+		t.logsPanelViewport.Width = max(1, msg.Width-8)
+		t.logsPanelViewport.Height = max(1, msg.Height-13)
+		t.logsPanelViewportReady = true
+		t.logsPanelViewport.SetContent(wordwrap.String(t.jxscout.GetLogBuffer().String(), t.logsPanelViewport.Width))
+	case dashboardDataMsg:
+		t.refreshPending = false
+		if msg.project == t.jxscout.GetOptions().ProjectName && msg.root == common.GetWorkingDirectory(msg.project) {
+			t.assets, t.assetTotal = msg.assets, msg.total
+			t.dataError = ""
+			if msg.err != nil {
+				t.dataError = msg.err.Error()
+			}
+		}
+	case findingsDataMsg:
+		if msg.requestID == t.findingsRequestID {
+			t.findingsRefreshPending = false
+		}
+		if msg.requestID == t.findingsRequestID && msg.project == t.jxscout.GetOptions().ProjectName && msg.root == common.GetWorkingDirectory(msg.project) {
+			t.findings = msg.matches
+			t.findingCount = len(msg.matches)
+			if msg.err != nil {
+				t.dataError = msg.err.Error()
+			}
 		}
 	case LogsTickMsg:
-		cmds = append(cmds, logsTickerCmd())
+		cmds = append(cmds, logsTickerCmd(), t.refreshDashboard(), t.refreshFindings())
+		if t.logsPanelShown && t.logsPanelViewportReady {
+			t.logsPanelViewport.SetContent(wordwrap.String(t.jxscout.GetLogBuffer().String(), t.logsPanelViewport.Width))
+			if t.autoScroll {
+				t.logsPanelViewport.GotoBottom()
+			}
+		}
+	case tea.KeyMsg:
+		if msg.Type == tea.KeyCtrlC {
+			cmd, err := t.ExecuteCommand("exit")
+			if err != nil {
+				t.panelError = err.Error()
+			}
+			return t, cmd
+		}
+		if t.commandMode {
+			switch msg.Type {
+			case tea.KeyEsc:
+				t.commandMode = false
+				t.input.Reset()
+				t.input.Blur()
+				return t, nil
+			case tea.KeyEnter:
+				command := strings.TrimSpace(t.input.Value())
+				t.commandMode = false
+				t.input.Reset()
+				t.input.Blur()
+				if command != "" {
+					t.output = ""
+					t.notice = ""
+					t.addToHistory(command)
+					cmd, err := t.ExecuteCommand(command)
+					if err != nil {
+						t.writeLineToOutput(fmt.Sprintf("Error: %s", err))
+					}
+					cmds = append(cmds, cmd)
+				}
+				return t, tea.Batch(cmds...)
+			case tea.KeyUp:
+				if t.historyIndex > 0 {
+					t.historyIndex--
+					t.input.SetValue(t.history[t.historyIndex])
+				}
+				return t, nil
+			case tea.KeyDown:
+				if t.historyIndex < len(t.history)-1 {
+					t.historyIndex++
+					t.input.SetValue(t.history[t.historyIndex])
+				} else {
+					t.input.Reset()
+				}
+				return t, nil
+			}
+			var cmd tea.Cmd
+			t.input, cmd = t.input.Update(msg)
+			return t, cmd
+		}
+		if !t.editing {
+			target := ""
+			navigate := false
+			switch msg.Type {
+			case tea.KeyF2:
+				target = "projects"
+				navigate = true
+			case tea.KeyF3:
+				target = "scope"
+				navigate = true
+			case tea.KeyF4:
+				target = "logs"
+				navigate = true
+			case tea.KeyF5:
+				target = "findings"
+				navigate = true
+			case tea.KeyTab, tea.KeyShiftTab:
+				pages := []string{"", "projects", "scope", "logs", "findings"}
+				index := 0
+				for i, p := range pages {
+					if p == t.panel {
+						index = i
+					}
+				}
+				step := 1
+				if msg.Type == tea.KeyShiftTab {
+					step = 4
+				}
+				target = pages[(index+step)%len(pages)]
+				navigate = true
+			case tea.KeyRunes:
+				switch string(msg.Runes) {
+				case "1":
+					target = ""
+					navigate = true
+				case "2":
+					target = "projects"
+					navigate = true
+				case "3":
+					target = "scope"
+					navigate = true
+				case "4":
+					target = "logs"
+					navigate = true
+				case "5":
+					target = "findings"
+					navigate = true
+				case ":":
+					return t, t.startCommand()
+				case "?":
+					t.output = t.GetHelp()
+					return t, nil
+				}
+			}
+			if navigate {
+				t.output = ""
+				t.openPanel(target)
+				if target == "findings" {
+					return t, t.refreshFindings()
+				}
+				return t, nil
+			}
+		}
+		if t.output != "" {
+			if msg.Type == tea.KeyEsc {
+				t.output = ""
+				return t, nil
+			}
+			var cmd tea.Cmd
+			t.resultViewport, cmd = t.resultViewport.Update(msg)
+			return t, cmd
+		}
+		if t.logsPanelShown {
+			if msg.Type == tea.KeyEsc {
+				t.closePanel()
+				return t, nil
+			}
+			if msg.Type == tea.KeyRunes {
+				switch string(msg.Runes) {
+				case "s":
+					t.autoScroll = !t.autoScroll
+					return t, nil
+				case "c":
+					t.jxscout.GetLogBuffer().Clear()
+					t.logsPanelViewport.SetContent("")
+					return t, nil
+				}
+			}
+			if msg.Type == tea.KeyUp || msg.Type == tea.KeyPgUp {
+				t.autoScroll = false
+			}
+			var cmd tea.Cmd
+			t.logsPanelViewport, cmd = t.logsPanelViewport.Update(msg)
+			return t, cmd
+		}
+		if t.panel != "" {
+			if t.panel == "findings" {
+				switch msg.Type {
+				case tea.KeyUp:
+					if t.panelIndex > 0 {
+						t.panelIndex--
+					}
+					return t, nil
+				case tea.KeyDown:
+					t.panelIndex++
+					return t, nil
+				case tea.KeyRunes:
+					if string(msg.Runes) == "5" {
+						return t, t.refreshFindings()
+					}
+				}
+			}
+			return t, t.panelUpdate(msg)
+		}
+		if msg.Type == tea.KeyRunes {
+			// Preserve direct command entry for existing users, while keeping the home view clean.
+			cmd := t.startCommand()
+			t.input.SetValue(string(msg.Runes))
+			return t, cmd
+		}
 	}
-
-	if t.logsPanelShown && t.logsPanelViewportReady {
-		cmd = t.handleLogsViewUpdate(msg)
-		cmds = append(cmds, cmd)
-	} else {
-		cmd = t.handlePromptViewUpdate(msg)
+	if t.editing || t.commandMode {
+		var cmd tea.Cmd
+		t.input, cmd = t.input.Update(msg)
 		cmds = append(cmds, cmd)
 	}
-
 	return t, tea.Batch(cmds...)
 }
 
-func (t *TUI) logsHeader() string {
-	return fmt.Sprintf("%s\n", lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("205")).
-		Padding(0, 1).
-		Render("Logs"))
-}
-
-func (t *TUI) logsFooter() string {
-	autoScrollText := "Auto-scroll: ON"
-	if !t.autoScroll {
-		autoScrollText = "Auto-scroll: OFF"
-	}
-
-	controls := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("241")).
-		Padding(0, 1).
-		Width(t.logsPanelViewport.Width / 2).
-		Align(lipgloss.Left).
-		Render("q: quit logs | s: toggle auto-scroll | c: clear logs")
-
-	info := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("241")).
-		Padding(0, 1).
-		Width(t.logsPanelViewport.Width / 2).
-		Align(lipgloss.Right).
-		Render(fmt.Sprintf("%s | Scroll (%.0f%%)", autoScrollText, t.logsPanelViewport.ScrollPercent()*100))
-
-	return fmt.Sprintf("\n%s%s", controls, info)
-}
-
-func (t *TUI) renderLogsPanel() string {
-	var s strings.Builder
-
-	s.WriteString(t.logsHeader())
-	s.WriteString(t.logsPanelViewport.View())
-	s.WriteString(t.logsFooter())
-
-	return s.String()
-}
-
-// View renders the TUI
-func (t *TUI) View() string {
-	var s strings.Builder
-
-	if t.logsPanelShown && t.logsPanelViewportReady {
-		return t.renderLogsPanel()
-	}
-
-	options := t.jxscout.GetOptions()
-	s.WriteString(fmt.Sprintf("JXScout  |  project: %s  |  capture: %s:%d\n", options.ProjectName, options.Hostname, options.Port))
-	s.WriteString(fmt.Sprintf("Output: %s\n", common.GetWorkingDirectory(options.ProjectName)))
-	if t.output == "" {
-		s.WriteString("\nassets · loads · loaded · config · logs · help\nCapture traffic through Burp/Caido; use jxscout analyze --help for local files.\n")
-	}
-
-	// Render output
-	s.WriteString("\n")
-	s.WriteString(t.output)
-	s.WriteString("\n")
-
-	// Render prompt and input
-	s.WriteString(t.input.View())
-
-	return s.String()
-}
+func (t *TUI) View() string { return t.renderDashboard() }

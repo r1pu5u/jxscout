@@ -12,6 +12,7 @@ import (
 	"github.com/francisconeves97/jxscout/internal/core/common"
 	"github.com/francisconeves97/jxscout/internal/core/dbeventbus"
 	"github.com/francisconeves97/jxscout/internal/core/errutil"
+	"github.com/francisconeves97/jxscout/internal/modules/webcrack"
 	jxscouttypes "github.com/francisconeves97/jxscout/pkg/types"
 	"github.com/jmoiron/sqlx"
 )
@@ -29,6 +30,11 @@ func NewBeautifier(concurrency int) *beautifierModule {
 
 func (m *beautifierModule) Initialize(sdk *jxscouttypes.ModuleSDK) error {
 	m.sdk = sdk
+	if sdk.Options.WebcrackMode == "required" {
+		if _, err := exec.LookPath("webcrack"); err != nil {
+			return err
+		}
+	}
 
 	go func() {
 		err := m.subscribeAssetSavedEvent()
@@ -83,7 +89,17 @@ func (m *beautifierModule) handleAssetSavedEvent(ctx context.Context, asset asse
 		return nil
 	}
 
-	err := beautify(asset.Path, asset.ContentType)
+	var err error
+	mode := m.sdk.Options.WebcrackMode
+	if asset.ContentType == common.ContentTypeJS && mode != "off" {
+		err = webcrack.Format(ctx, asset.Path)
+		if err != nil && mode != "required" {
+			m.sdk.Logger.Debug("webcrack unavailable or unsuccessful; using prettier", "err", err)
+			err = beautify(asset.Path, asset.ContentType)
+		}
+	} else {
+		err = beautify(asset.Path, asset.ContentType)
+	}
 	if err != nil {
 		return errutil.Wrap(err, "failed to beautify asset")
 	}

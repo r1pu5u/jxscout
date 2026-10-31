@@ -81,3 +81,45 @@ func readWorkspaceConfig(path string) (WorkspaceConfig, bool, error) {
 	}
 	return config, true, nil
 }
+
+// ValidateProjectName keeps project state paths within the configured root.
+func ValidateProjectName(name string) error {
+	if name == "" || name == "." || name == ".." {
+		return fmt.Errorf("invalid project name: %q", name)
+	}
+	for _, c := range name {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.') {
+			return fmt.Errorf("invalid project name: %q; use letters, numbers, dots, underscores or hyphens", name)
+		}
+	}
+	return nil
+}
+
+// SaveWorkspaceSelection updates the local marker after an interactive change.
+// CLI flags remain per-invocation overrides.
+func SaveWorkspaceSelection(project string, scope []string) error {
+	root := os.Getenv("JXSCOUT_PROJECT_ROOT")
+	if root == "" || os.Getenv("JXSCOUT_DATA_DIR") != "" {
+		return nil
+	}
+	file := filepath.Join(root, "config.json")
+	config, exists, err := readWorkspaceConfig(file)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	config.Project, config.Scope = project, scope
+	if config.Scope == nil {
+		config.Scope = []string{}
+	}
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeJSONAtomic(file, data); err != nil {
+		return err
+	}
+	return RegisterProject(project, root, scope)
+}

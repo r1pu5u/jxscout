@@ -32,7 +32,6 @@ import (
 	jsingestion "github.com/francisconeves97/jxscout/internal/modules/js-ingestion"
 	"github.com/francisconeves97/jxscout/internal/modules/overrides"
 	"github.com/francisconeves97/jxscout/internal/modules/sourcemaps"
-	"github.com/francisconeves97/jxscout/internal/modules/webcrack"
 	jxscouttypes "github.com/francisconeves97/jxscout/pkg/types"
 	"github.com/jmoiron/sqlx"
 
@@ -214,7 +213,6 @@ func (s *jxscout) registerCoreModules() {
 		jsingestion.NewJSIngestionModule(s.options.DownloadReferedJS),
 		htmlingestion.NewHTMLIngestionModule(),
 		beautifier.NewBeautifier(s.options.BeautifierConcurrency),
-		webcrack.New(s.options.BeautifierConcurrency, s.options.WebcrackMode),
 		chunkdiscoverer.NewChunkDiscovererModule(
 			s.options.ChunkDiscovererConcurrency,
 			s.options.ChunkDiscovererBruteForceLimit,
@@ -389,13 +387,10 @@ func (s *jxscout) Restart(options jxscouttypes.Options) (*jxscout, error) {
 
 	s.registerCoreModules()
 
-	go func() {
-		// use private method so we don't restart the prompt
-		err := s.start()
-		if err != nil {
-			s.log.Error("failed to restart server", "error", err)
-		}
-	}()
+	// Start synchronously so project changes report listener failures.
+	if err := s.start(); err != nil {
+		return nil, errutil.Wrap(err, "failed to restart server")
+	}
 
 	return s, nil
 }

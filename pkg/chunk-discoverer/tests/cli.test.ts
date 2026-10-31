@@ -31,6 +31,12 @@ test("help presents proxy capture and does not expose a scan command", async () 
   expect(result.code).toBe(0);
   expect(result.stdout).toContain("serve");
   expect(result.stdout).not.toMatch(/^\s+scan(?:\s|$)/m);
+  expect(result.stdout).not.toMatch(/^\s+tui(?:\s|$)/m);
+});
+test("removed tui command directs users to serve", async () => {
+  const result = await runCLI(["tui"]);
+  expect(result.code).toBe(1);
+  expect(result.stderr).toContain("jxscout serve");
 });
 test("removed scan command directs users to serve without creating state", async () => {
   const dir = mkdtempSync(path.join(tmpdir(), "jxscout-no-scan-"));

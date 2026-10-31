@@ -25,7 +25,8 @@ type SaveFileRequest struct {
 	// because in reality this will be a URL
 	PathURL string
 	// Content is the file content
-	Content *string
+	Content    *string
+	JavaScript bool
 }
 
 type FileService interface {
@@ -69,6 +70,9 @@ func (s *fileServiceImpl) save(ctx context.Context, filePath []string, req SaveF
 		return "", errutil.Wrap(err, "failed to convert url to path")
 	}
 
+	if req.JavaScript && !strings.HasSuffix(strings.ToLower(targetPath), ".js") {
+		targetPath += ".js"
+	}
 	targetPath, err = s.SimpleSave(targetPath, req.Content)
 	if err != nil {
 		return "", errutil.Wrap(err, "failed to write file")
@@ -123,6 +127,9 @@ func (s *fileServiceImpl) FileExists(pathURL string, subfolder string) (bool, er
 	}
 
 	_, err = os.Stat(filePath)
+	if os.IsNotExist(err) {
+		_, err = os.Stat(filePath + ".js")
+	}
 	if err == nil {
 		return true, nil
 	}

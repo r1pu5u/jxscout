@@ -2,11 +2,15 @@ package jxscout
 
 import (
 	"errors"
+	"github.com/francisconeves97/jxscout/internal/core/common"
 
 	jxscouttypes "github.com/francisconeves97/jxscout/pkg/types"
 )
 
 func validateOptions(options jxscouttypes.Options) error {
+	if err := common.ValidateProjectName(options.ProjectName); err != nil {
+		return err
+	}
 	if options.WebcrackMode != "" && options.WebcrackMode != "auto" && options.WebcrackMode != "off" && options.WebcrackMode != "required" {
 		return errors.New("webcrack must be auto, off, or required")
 	}

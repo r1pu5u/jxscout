@@ -75,21 +75,13 @@ func (m *htmlIngestionModule) handleIngestionRequest(req *ingestion.IngestionReq
 
 	m.sdk.Logger.Debug("htmlingestion - saving html asset", "html_path", htmlPath)
 
-	m.sdk.AssetService.AsyncSaveAsset(m.sdk.Ctx, &assetservice.Asset{
-		URL:            htmlPath,
-		Content:        &req.Response.Body,
-		ContentType:    common.ContentTypeHTML,
-		Project:        m.sdk.Options.ProjectName,
-		RequestHeaders: req.Request.Headers,
-	})
-
 	extractedJS, err := extractJS(req.Response.Body, req.Request.URL)
 	if err != nil {
 		return errutil.Wrap(err, "failed to extract JS")
 	}
 
 	for _, scriptURL := range extractedJS.scriptURLs {
-		if !m.sdk.Scope.IsInScope(scriptURL) {
+		if common.IsCaptureNoise(scriptURL) || !m.sdk.Scope.IsInScope(scriptURL) {
 			continue
 		}
 		headers := req.Request.Headers
@@ -139,6 +131,9 @@ func (m *htmlIngestionModule) getContentType(req ingestion.IngestionRequest) str
 }
 
 func (m *htmlIngestionModule) validateIngestionRequest(req *ingestion.IngestionRequest) error {
+	if req == nil || common.IsCaptureNoise(req.Request.URL) || common.IsStaticAssetURL(req.Request.URL) {
+		return errors.New("not an HTML document URL")
+	}
 	if !m.sdk.Scope.IsInScope(req.Request.URL) {
 		return errors.New("request is not in scope")
 	}

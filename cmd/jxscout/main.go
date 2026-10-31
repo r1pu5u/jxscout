@@ -30,12 +30,9 @@ func main() {
 	if len(os.Args) == 1 || os.Args[1] == "--help" || os.Args[1] == "-h" {
 		os.Exit(agentcli.Run(nil))
 	}
-	serverMode := os.Args[1] == "serve" || os.Args[1] == "tui"
+	serverMode := os.Args[1] == "serve"
 	switch os.Args[1] {
-	case "tui":
-		os.Args = append(os.Args[:1], os.Args[2:]...)
 	case "serve":
-		os.Setenv("JXSCOUT_HEADLESS", "true")
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	default:
 		if os.Args[1][0] != '-' {
@@ -45,7 +42,20 @@ func main() {
 	if serverMode {
 		os.Args = rewriteProjectAlias(os.Args)
 	}
-	projectFlagSet := hasOption(os.Args[1:], "project-name", "project")
+	selectedProject, projectFlagSet := projectOption(os.Args[1:])
+	if projectFlagSet && os.Getenv("JXSCOUT_DATA_DIR") == "" {
+		project, found, err := common.RegisteredProject(selectedProject)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if found {
+			workspaceRoot = project.Root
+			workspaceConfig = common.WorkspaceConfig{Version: 1, Project: selectedProject, Scope: project.Scope}
+			hasWorkspace = true
+			os.Setenv("JXSCOUT_PROJECT_ROOT", workspaceRoot)
+		}
+	}
+	useWorkspaceDefaults := hasWorkspace && (!projectFlagSet || selectedProject == workspaceConfig.Project)
 	scopeFlagSet := hasOption(os.Args[1:], "scope")
 
 	options := jxscouttypes.Options{}
@@ -53,6 +63,10 @@ func main() {
 	flagSet := goflags.NewFlagSet()
 
 	flagSet.SetDescription("jxscout | static files downloader for vulnerability analysis")
+	flagSet.SetCustomHelpText("Select project: --project NAME (alias: -p NAME, --project-name NAME). In the TUI, use: project NAME")
+
+	headless := false
+	flagSet.BoolVar(&headless, "headless", false, "run capture without the interactive dashboard")
 
 	flagSet.CreateGroup("server", "server configuration",
 		flagSet.StringVar(&options.Hostname, constants.FlagHostname, constants.DefaultHostname, constants.DescriptionHostname),
@@ -104,7 +118,7 @@ func main() {
 		flagSet.DurationVar(&options.OverrideContentCheckInterval, constants.FlagOverrideContentCheckInterval, constants.DefaultOverrideContentCheckInterval, constants.DescriptionOverrideContentCheckInterval),
 	)
 
-	if hasWorkspace && !projectFlagSet {
+	if useWorkspaceDefaults && !projectFlagSet {
 		options.ProjectName = workspaceConfig.Project
 	} else if options.ProjectName == constants.DefaultProjectName && !projectFlagSet {
 		projectName, err := common.GetProjectName()
@@ -113,8 +127,15 @@ func main() {
 		}
 		options.ProjectName = projectName
 	}
-	if hasWorkspace && !scopeFlagSet {
+	if useWorkspaceDefaults && !scopeFlagSet {
 		options.ScopePatterns = workspaceConfig.Scope
+	}
+
+	if projectFlagSet {
+		if err := common.ValidateProjectName(selectedProject); err != nil {
+			log.Fatal(err)
+		}
+		options.ProjectName = selectedProject
 	}
 
 	err := jxscout.CheckAndMigrateOldVersion()
@@ -129,11 +150,19 @@ func main() {
 		log.Fatalf("could not parse flags: %s", err.Error())
 	}
 
-	if hasWorkspace && !projectFlagSet {
+	if useWorkspaceDefaults && !projectFlagSet {
 		options.ProjectName = workspaceConfig.Project
 	}
-	if hasWorkspace && !scopeFlagSet {
+	if useWorkspaceDefaults && !scopeFlagSet {
 		options.ScopePatterns = workspaceConfig.Scope
+	}
+	if hasWorkspace && os.Getenv("JXSCOUT_DATA_DIR") == "" {
+		if err := common.RegisterProject(workspaceConfig.Project, workspaceRoot, workspaceConfig.Scope); err != nil {
+			log.Fatal(err)
+		}
+	}
+	if headless {
+		os.Setenv("JXSCOUT_HEADLESS", "true")
 	}
 	jxscout, err := jxscout.NewJXScout(options)
 	if err != nil {
@@ -164,6 +193,10 @@ func hasOption(args []string, names ...string) bool {
 func rewriteProjectAlias(args []string) []string {
 	rewritten := append([]string(nil), args...)
 	for i, arg := range rewritten {
+		if arg == "-p" || strings.HasPrefix(arg, "-p=") {
+			rewritten[i] = "--project-name" + strings.TrimPrefix(arg, "-p")
+			continue
+		}
 		if arg == "--project" || arg == "-project" {
 			rewritten[i] = strings.Replace(arg, "project", "project-name", 1)
 			continue
@@ -173,4 +206,26 @@ func rewriteProjectAlias(args []string) []string {
 		}
 	}
 	return rewritten
+}
+
+// projectOption selects the config file before goflags merges it with CLI flags.
+func projectOption(args []string) (string, bool) {
+	var project string
+	found := false
+	for i := 0; i < len(args); i++ {
+		name, value, inline := strings.Cut(strings.TrimLeft(args[i], "-"), "=")
+		if name != "project-name" && name != "project" && name != "p" {
+			continue
+		}
+		found = true
+		if inline {
+			project = value
+		} else if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			i++
+			project = args[i]
+		} else {
+			project = ""
+		}
+	}
+	return project, found
 }

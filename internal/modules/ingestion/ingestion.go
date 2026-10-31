@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/francisconeves97/jxscout/internal/core/common"
 	"github.com/francisconeves97/jxscout/internal/core/eventbus"
 	jxscouttypes "github.com/francisconeves97/jxscout/pkg/types"
 )
@@ -81,6 +82,9 @@ func (m *ingestionModule) handleIngestionCaidoIngestionEndpoint(w http.ResponseW
 }
 
 func (m *ingestionModule) handleIngestionRequest(req IngestionRequest) {
+	if common.IsCaptureNoise(req.Request.URL) {
+		return
+	}
 	m.sdk.InMemoryEventBus.Publish(TopicIngestionRequestReceived, eventbus.Message{
 		Data: EventIngestionRequestReceived{
 			IngestionRequest: &req,
