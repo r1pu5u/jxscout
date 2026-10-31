@@ -2,9 +2,9 @@
 package webcrack
 
 import (
-	"bytes"
 	"context"
 	"fmt"
+	"github.com/francisconeves97/jxscout/internal/core/common"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,15 +16,6 @@ import (
 func Format(ctx context.Context, file string) error {
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "webcrack", file, "--no-unpack")
-	var code, diagnostics bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &code, &diagnostics
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("webcrack: %w: %.2000s", err, diagnostics.String())
-	}
-	if code.Len() == 0 {
-		return fmt.Errorf("webcrack returned empty JavaScript")
-	}
 	info, err := os.Stat(file)
 	if err != nil {
 		return err
@@ -34,12 +25,23 @@ func Format(ctx context.Context, file string) error {
 		return err
 	}
 	defer os.Remove(temp.Name())
-	if _, err = temp.Write(code.Bytes()); err != nil {
-		temp.Close()
+	defer temp.Close()
+	cmd := exec.CommandContext(ctx, "webcrack", file, "--no-unpack")
+	diagnostics := common.NewTailBuffer(8192)
+	// An *os.File lets the child stream stdout directly to disk. The original
+	// script is replaced only after successful completion and a nonempty result.
+	cmd.Stdout, cmd.Stderr = temp, diagnostics
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("webcrack: %w: %.2000s", err, diagnostics.String())
+	}
+	output, err := temp.Stat()
+	if err != nil {
 		return err
 	}
+	if output.Size() == 0 {
+		return fmt.Errorf("webcrack returned empty JavaScript")
+	}
 	if err = temp.Chmod(info.Mode().Perm()); err != nil {
-		temp.Close()
 		return err
 	}
 	if err = temp.Close(); err != nil {

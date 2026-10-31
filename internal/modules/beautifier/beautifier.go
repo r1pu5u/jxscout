@@ -1,7 +1,6 @@
 package beautifier
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -141,8 +140,8 @@ func beautify(filePath string, contentType common.ContentType) error {
 
 	cmd := exec.Command("prettier", filePath, "--write", fmt.Sprintf("--parser=%s", parser))
 
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
+	stderr := common.NewTailBuffer(8192)
+	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
 		return errutil.Wrap(err, "error starting command")

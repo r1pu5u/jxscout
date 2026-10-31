@@ -214,6 +214,8 @@ func (t *TUI) RegisterDefaultCommands() {
 						currentOptions.ScopePatterns = nil
 					case constants.FlagDebug:
 						currentOptions.Debug = constants.DefaultDebug
+					case "chunk-parser-concurrency":
+						currentOptions.ChunkParserConcurrency = 1
 					case constants.FlagAssetFetchConcurrency:
 						currentOptions.AssetFetchConcurrency = constants.DefaultAssetFetchConcurrency
 					case constants.FlagAssetSaveConcurrency:
@@ -317,6 +319,12 @@ func (t *TUI) RegisterDefaultCommands() {
 						return nil, fmt.Errorf("invalid debug value: %s", value)
 					}
 					currentOptions.Debug = debug
+				case "chunk-parser-concurrency":
+					concurrency, err := strconv.Atoi(value)
+					if err != nil || concurrency < 1 {
+						return nil, fmt.Errorf("chunk-parser-concurrency must be at least 1")
+					}
+					currentOptions.ChunkParserConcurrency = concurrency
 				case constants.FlagAssetFetchConcurrency:
 					concurrency, err := strconv.Atoi(value)
 					if err != nil {
@@ -1275,6 +1283,7 @@ func (t *TUI) printCurrentConfig() {
 		descStyle.Render(constants.DescriptionDebug)))
 
 	// Concurrency configuration
+	t.writeLineToOutput(formatLine("chunk-parser-concurrency", fmt.Sprint(max(1, currentOptions.ChunkParserConcurrency)), "Maximum concurrent discovery parsers and validators"))
 	t.writeLineToOutput(formatLine(
 		constants.FlagAssetFetchConcurrency,
 		fmt.Sprintf("%d", currentOptions.AssetFetchConcurrency),

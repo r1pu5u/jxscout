@@ -49,6 +49,7 @@ type Options struct {
 	AssetSaveConcurrency             int                 `yaml:"save-concurrency"`
 	AssetFetchConcurrency            int                 `yaml:"fetch-concurrency"`
 	BeautifierConcurrency            int                 `yaml:"beautifier-concurrency"`
+	ChunkParserConcurrency           int                 `yaml:"chunk-parser-concurrency"`
 	ChunkDiscovererConcurrency       int                 `yaml:"chunk-discoverer-concurrency"`
 	ASTAnalyzerConcurrency           int                 `yaml:"ast-analyzer-concurrency"`
 	ChunkDiscovererBruteForceLimit   int                 `yaml:"chunk-discoverer-bruteforce-limit"`

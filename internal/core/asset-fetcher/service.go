@@ -1,7 +1,7 @@
 package assetfetcher
 
 import (
-	"bytes"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -130,35 +130,44 @@ func (s *assetFetcherImpl) Get(ctx context.Context, url string, headers map[stri
 	}
 	defer resp.Body.Close()
 
-	// Read the entire response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", false, errutil.Wrap(err, "error reading response body")
+	return readResponse(resp)
+}
+
+// Stream decompression directly into the returned string. No full compressed
+// copy or second []byte-to-string copy is retained for successful responses.
+func readResponse(resp *http.Response) (string, bool, error) {
+	if resp.StatusCode != http.StatusOK {
+		// Drain only small error bodies to preserve HTTP connection reuse. Large
+		// error pages are closed without retaining or decoding the full response.
+		if resp.ContentLength <= 32<<10 {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 32<<10))
+		}
+		return "", false, nil
 	}
-
-	// Check if the response is gzipped
-	contentEncoding := resp.Header.Get("Content-Encoding")
-	isGzipped := strings.Contains(contentEncoding, "gzip")
-
-	// If not marked as gzipped, check for gzip magic number
-	if !isGzipped {
-		isGzipped = len(body) > 2 && body[0] == 0x1f && body[1] == 0x8b
-	}
-
-	// If gzipped, decompress
-	if isGzipped {
-		reader, err := gzip.NewReader(bytes.NewReader(body))
+	input := bufio.NewReader(resp.Body)
+	prefix, _ := input.Peek(2)
+	isGzip := strings.Contains(strings.ToLower(resp.Header.Get("Content-Encoding")), "gzip") || (len(prefix) == 2 && prefix[0] == 0x1f && prefix[1] == 0x8b)
+	var reader io.Reader = input
+	if isGzip {
+		decompressed, err := gzip.NewReader(input)
 		if err != nil {
 			return "", false, errutil.Wrap(err, "error creating gzip reader")
 		}
-		defer reader.Close()
-
-		decompressed, err := io.ReadAll(reader)
-		if err != nil {
-			return "", false, errutil.Wrap(err, "error decompressing response body")
-		}
-		body = decompressed
+		defer decompressed.Close()
+		reader = decompressed
 	}
+	var body responseText
+	if _, err := io.Copy(&body, reader); err != nil {
+		return "", false, errutil.Wrap(err, "error reading response body")
+	}
+	return body.String(), true, nil
+}
 
-	return string(body), resp.StatusCode == http.StatusOK, nil
+// Explicit growth avoids repeatedly copying multi-megabyte responses through
+// append's small capacity increments. String returns the final buffer directly.
+type responseText struct{ strings.Builder }
+
+func (s *responseText) Write(p []byte) (int, error) {
+	s.Grow(len(p))
+	return s.Builder.Write(p)
 }

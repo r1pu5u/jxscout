@@ -1,5 +1,6 @@
 import { Program } from "acorn";
 import { is, NodePath, traverse } from "estree-toolkit";
+import { full, fullAncestor } from "acorn-walk";
 import {
   AssignmentExpression,
   Expression,
@@ -321,33 +322,17 @@ export const matchesFunctionDeclarationChunkBuilderFunction = (
 // Vite
 export const getViteChunks = (ast: Program): string[] => {
   const chunks: string[] = [];
-
-  traverse(ast, {
-    Identifier(path) {
-      if (path.node?.name !== VITE_MAP_DEPS_FINGERPRINT) {
-        return;
-      }
-
-      const variableDeclarator = path.parentPath;
-      if (!is.variableDeclarator(variableDeclarator)) {
-        return;
-      }
-
-      variableDeclarator.traverse({
-        Literal(path) {
-          if (typeof path.node?.value !== "string") {
-            return;
-          }
-
-          const value = path.node.value;
-          if (value.includes(".js")) {
-            chunks.push(value);
-          }
-        },
-      });
-
-      this.stop();
-    },
+  let target: any;
+  fullAncestor(ast, (node: any, _state: any, ancestors: any[]) => {
+    if (!target && node.type === "Identifier" && node.name === VITE_MAP_DEPS_FINGERPRINT) {
+      const parent = ancestors[ancestors.length - 2];
+      if (parent?.type === "VariableDeclarator") target = parent;
+    }
+  });
+  if (!target) return chunks;
+  full(target, (node: any) => {
+    if (node.type !== "Literal" || typeof node.value !== "string") return;
+    if (node.value.includes(".js")) chunks.push(node.value);
   });
 
   return chunks;

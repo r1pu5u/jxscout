@@ -1,5 +1,6 @@
 import { parse } from "acorn-loose";
 import { simple, full, fullAncestor } from "acorn-walk";
+import type { Program } from "acorn";
 
 export interface Candidate {
   specifier: string;
@@ -75,6 +76,17 @@ export function deepDiscover(
   unresolved: { expression: string; start: number }[] = [],
 ): Candidate[] {
   const ast: any = parse(code, { ecmaVersion: "latest", sourceType: "module" });
+  return deepDiscoverAst(ast, code, templates, limit, unresolved);
+}
+
+/** Run deep discovery against an AST already parsed by the caller. */
+export function deepDiscoverAst(
+  ast: Program,
+  code: string,
+  templates: string[] = [],
+  limit = 3000,
+  unresolved: { expression: string; start: number }[] = [],
+): Candidate[] {
   const cssMaps = new Set<number>();
   fullAncestor(ast, (n: any, _state: any, parents: any[]) => {
     if (n.type !== "ObjectExpression") return;
@@ -89,14 +101,14 @@ export function deepDiscover(
   });
   const bindings = new Map<string, any>();
   const ids = new Set<string>();
-  const candidates: Candidate[] = [];
+  const candidates = new Map<string, Candidate>();
   const add = (value: any, method: string, node: any, extra = {}) => {
     if (
       typeof value === "string" &&
       /(?:^|\/)[^/?#]+\.(?:m?js|cjs)(?:[?#].*)?$/.test(value) &&
       !/[\n\r\0]/.test(value)
     )
-      candidates.push({
+      candidates.set(value, {
         specifier: value,
         method,
         start: node.start,
@@ -119,7 +131,37 @@ export function deepDiscover(
   });
   const unknown = Symbol("unknown");
   const publicPaths = new Map<string, string>();
-  function evaluate(n: any, env = new Map<string, any>(), depth = 0): any {
+  const emptyEnv = new Map<string, any>();
+  // Evaluation follows bindings, which can be cyclic or share large object
+  // graphs. Cache per environment so runtime IDs never share context-sensitive
+  // results. Keep an active set separate so cycles resolve to unknown.
+  type EvaluationState = { values: WeakMap<object, any>; active: WeakSet<object> };
+  const states = new WeakMap<Map<string, any>, EvaluationState>();
+  const stateFor = (env: Map<string, any>): EvaluationState => {
+    let state = states.get(env);
+    if (!state) {
+      state = { values: new WeakMap(), active: new WeakSet() };
+      states.set(env, state);
+    }
+    return state;
+  };
+  function evaluate(n: any, env = emptyEnv, depth = 0): any {
+    if (n && typeof n === "object") {
+      const state = stateFor(env);
+      if (state.values.has(n)) return state.values.get(n);
+      if (state.active.has(n)) return unknown;
+      state.active.add(n);
+      let result: any;
+      try {
+        result = evaluateNode(n, env, depth);
+      } catch {
+        result = unknown;
+      } finally {
+        state.active.delete(n);
+      }
+      state.values.set(n, result);
+      return result;
+    }
     try {
       return evaluateNode(n, env, depth);
     } catch {
@@ -150,6 +192,23 @@ export function deepDiscover(
         const receiver = code.slice(n.object.start, n.object.end);
         if (key === "p" && publicPaths.has(receiver))
           return publicPaths.get(receiver);
+        // Runtime builders commonly index one entry from a large constant
+        // hash table. Evaluate that property directly instead of rebuilding
+        // the entire object for every runtime ID.
+        const objectNode =
+          n.object.type === "Identifier"
+            ? bindings.get(n.object.name)
+            : n.object;
+        if (objectNode?.type === "ObjectExpression" && key !== unknown) {
+          for (const prop of objectNode.properties) {
+            if (prop.type !== "Property") continue;
+            const propKey = prop.computed
+              ? ev(prop.key)
+              : (prop.key.name ?? prop.key.value);
+            if (propKey === key) return ev(prop.value);
+          }
+          return unknown;
+        }
         const obj = ev(n.object);
         return obj !== unknown &&
           obj != null &&
@@ -266,6 +325,11 @@ export function deepDiscover(
             );
       }
   }
+  // The static pass has already emitted all data needed from global hash
+  // maps. Drop their materialized JS objects; runtime lookups above are lazy.
+  const emptyState = stateFor(emptyEnv);
+  for (const node of bindings.values())
+    if (node?.type === "ObjectExpression") emptyState.values.delete(node);
   full(ast, (n: any) => {
     if (
       n.type === "AssignmentExpression" &&
@@ -280,6 +344,9 @@ export function deepDiscover(
         );
     }
   });
+  // The empty-environment results above predate the discovered public paths.
+  // Drop them so later runtime-builder evaluation can resolve `.p` accesses.
+  states.set(emptyEnv, { values: new WeakMap(), active: new WeakSet() });
   full(ast, (n: any) => {
     if (n.type === "ImportExpression") add(evaluate(n.source), "import", n);
     // Precache manifests store paths in object records, not only string arrays.
@@ -349,12 +416,10 @@ export function deepDiscover(
     const candidateCount = candidates.length;
     const params = new Set(ids);
     for (let i = 0; i < limit; i++) params.add(String(i));
-    for (const id of params)
+    for (const id of params) {
+      const env = new Map([[fn.params[0].name, /^\d+$/.test(id) ? Number(id) : id]]);
       for (const expression of returns) {
-        const value = evaluate(
-          expression,
-          new Map([[fn.params[0].name, /^\d+$/.test(id) ? Number(id) : id]]),
-        );
+        const value = evaluate(expression, env);
         if (typeof value === "string")
           add(
             (publicPaths.get(
@@ -365,11 +430,12 @@ export function deepDiscover(
             { id },
           );
       }
+    }
     if (candidates.length === candidateCount)
       unresolved.push({
         expression: code.slice(fn.start, fn.end),
         start: fn.start,
       });
   });
-  return [...new Map(candidates.map((c) => [c.specifier, c])).values()];
+  return [...candidates.values()];
 }

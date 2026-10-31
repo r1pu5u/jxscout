@@ -129,3 +129,36 @@ Prettier/Webcrack completion. Starting `serve` also resumes discovery from saved
 project scripts. Candidate responses must be successful HTTP responses and pass
 a JavaScript parser before they are saved; HTML, JSON, CSS, and malformed scripts
 are rejected. Downloaded chunks trigger the same discovery pipeline recursively.
+
+## Discovery resource usage
+
+Discovery shares one parser/validator slot by default, independently of HTTP
+fetch concurrency. Source files stream into the parser instead of being held in
+Go memory while downloads run. A single AST serves the discovery strategies;
+in-memory deduplication caches are bounded. Candidate results are cached in the
+project's SQLite state and reused when the script, seed URLs, parser version,
+and brute-force limit match; restarting still checks for missing chunk files.
+
+Use `--chunk-parser-concurrency 1` for the lowest parallel parser memory usage,
+or increase it to trade more memory for parallel analysis. Formatting and AST
+findings have separate concurrency controls. For lower overall memory use:
+
+```sh
+jxscout serve --chunk-parser-concurrency 1 \
+  --beautifier-concurrency 1 --ast-analyzer-concurrency 1
+```
+
+HTTP gzip bodies are streamed into the final response text instead of retaining
+full compressed and decompressed copies. Webcrack streams its output to a
+short-lived file and atomically replaces the same `.js` on success; partial or
+empty formatter output never replaces the script. Formatter and discovery
+stderr buffers retain at most 8 KiB each.
+
+A local 6 MB gzip-response benchmark reduced Go allocations from about 39.4 MB
+to 16.5 MB per response, with identical decoded content. Reproduce the allocation
+comparison on your machine with:
+
+```sh
+go test ./internal/core/asset-fetcher -run '^$' \
+  -bench BenchmarkGzipResponseMemory -benchmem
+```

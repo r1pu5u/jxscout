@@ -723,3 +723,23 @@ test.each(testCases)(
     expect(new Set(chunks).size).toBe(chunks.length);
   },
 );
+
+test("escaped webpack fingerprint still enables legacy discovery", () => {
+  const code = readFile(path.join(__dirname, "files", "1.js")).replace(
+    '"Loading chunk "',
+    '"Loading chunk\\x20"',
+  );
+  expect(discoverChunks(code, 5)).toEqual(
+    expect.arrayContaining(testCases[0].expectedChunks),
+  );
+});
+
+test("escaped Vite fingerprint identifier still enables Vite discovery", () => {
+  const code = readFile(path.join(__dirname, "files", "26.js")).replace(
+    "__vite__mapDeps",
+    "__vite__mapDep\\u0073",
+  );
+  expect(discoverChunks(code, 5)).toEqual(
+    expect.arrayContaining(testCases[testCases.length - 1].expectedChunks),
+  );
+});

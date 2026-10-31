@@ -54,6 +54,18 @@ test("runtime public paths do not bleed into other runtimes", () => {
   );
   expect(result.map((c) => c.specifier)).toEqual(["/one/0.js", "/two/0.js"]);
 });
+test("cyclic constant bindings stop evaluation", () => {
+  const result = deepDiscover('const a=b;const b=a;r.u=id=>a+".js"', [], 2);
+  expect(result).toEqual([]);
+});
+test("runtime expression results remain isolated by ID", () => {
+  const result = deepDiscover(
+    'r.u=id=>id===0?"zero.js":"other.js"',
+    [],
+    2,
+  );
+  expect(result.map((c) => c.specifier)).toEqual(["zero.js", "other.js"]);
+});
 test("named seed filenames can establish a template", () => {
   expect(inferTemplate("https://h/vendors.a8bc39de.js")).toBe(
     "https://h/{id}.{hash}.js",

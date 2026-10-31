@@ -80,6 +80,7 @@ func main() {
 	)
 
 	flagSet.CreateGroup("concurrency", "concurrency configuration",
+		flagSet.IntVar(&options.ChunkParserConcurrency, "chunk-parser-concurrency", 1, "maximum concurrent chunk parsers and validators (default 1 for lower memory)"),
 		flagSet.IntVar(&options.AssetFetchConcurrency, constants.FlagAssetFetchConcurrency, constants.DefaultAssetFetchConcurrency, constants.DescriptionAssetFetchConcurrency),
 		flagSet.IntVar(&options.AssetSaveConcurrency, constants.FlagAssetSaveConcurrency, constants.DefaultAssetSaveConcurrency, constants.DescriptionAssetSaveConcurrency),
 		flagSet.IntVar(&options.BeautifierConcurrency, constants.FlagBeautifierConcurrency, constants.DefaultBeautifierConcurrency, constants.DescriptionBeautifierConcurrency),

@@ -1,6 +1,7 @@
-import { deepDiscover } from "./deep";
+import { deepDiscoverAst } from "./deep";
 import { Program } from "acorn";
 import { parse } from "acorn-loose";
+import { full } from "acorn-walk";
 import { is, traverse } from "estree-toolkit";
 import Sval from "sval";
 import {
@@ -12,6 +13,7 @@ import { getChunkFunctionCode } from "./transformer";
 export const discoverChunks = (
   code: string,
   bruteforceLimit: number,
+  templates: string[] = [],
 ): string[] => {
   let sourceType: "module" | "script" = "script";
   let ast: Program;
@@ -29,19 +31,34 @@ export const discoverChunks = (
     });
   }
 
-  let webpackChunks: string[] = [];
-  try {
-    webpackChunks = webpackCunkDiscovery(ast, sourceType, bruteforceLimit);
-  } catch {
-    /* retain independent strategies */
+  // Deep discovery runs first because the legacy transformer can rewrite nodes
+  // borrowed from the parsed tree while simplifying its extracted function.
+  const discovered = new Set(
+    deepDiscoverAst(ast, code, templates, bruteforceLimit).map((c) => c.specifier),
+  );
+  let hasViteFingerprint = code.includes("__vite__mapDeps");
+  let hasWebpackFingerprint = code.includes("Loading chunk ");
+  if (!hasViteFingerprint || !hasWebpackFingerprint) {
+    full(ast, (node: any) => {
+      if (node.type === "Identifier" && node.name === "__vite__mapDeps")
+        hasViteFingerprint = true;
+      if (node.type === "Literal" && node.value === "Loading chunk ")
+        hasWebpackFingerprint = true;
+    });
   }
-  return [
-    ...new Set([
-      ...webpackChunks,
-      ...viteChunkDiscovery(ast, sourceType, bruteforceLimit),
-      ...deepDiscover(code, [], bruteforceLimit).map((c) => c.specifier),
-    ]),
-  ];
+  if (hasViteFingerprint) {
+    for (const chunk of viteChunkDiscovery(ast, sourceType, bruteforceLimit))
+      discovered.add(chunk);
+  }
+  if (hasWebpackFingerprint) {
+    try {
+      for (const chunk of webpackCunkDiscovery(ast, sourceType, bruteforceLimit))
+        discovered.add(chunk);
+    } catch {
+      /* retain independent strategies */
+    }
+  }
+  return [...discovered];
 };
 
 const viteChunkDiscovery = (

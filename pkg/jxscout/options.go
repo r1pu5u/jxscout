@@ -8,6 +8,9 @@ import (
 )
 
 func validateOptions(options jxscouttypes.Options) error {
+	if options.ChunkParserConcurrency < 0 {
+		return errors.New("chunk-parser-concurrency cannot be negative")
+	}
 	if err := common.ValidateProjectName(options.ProjectName); err != nil {
 		return err
 	}

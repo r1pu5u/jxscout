@@ -3,9 +3,11 @@ package chunkdiscoverer
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -30,19 +32,29 @@ type chunkDiscovererModule struct {
 	concurrency               int
 	chunkDiscovererBinaryPath string
 	fetchSlots                chan struct{}
-	claimed                   sync.Map
-	processed                 sync.Map
+	claimed                   *boundedSet
+	processed                 *boundedSet
+	parserSlots               chan struct{}
+	processorHash             string
 }
 
 func NewChunkDiscovererModule(concurrency int, chunkBruteForceLimit int) *chunkDiscovererModule {
 	return &chunkDiscovererModule{
 		concurrency: concurrency,
+		claimed:     newBoundedSet(4096), processed: newBoundedSet(1024),
 	}
 }
 
 func (m *chunkDiscovererModule) Initialize(sdk *jxscouttypes.ModuleSDK) error {
 	m.sdk = sdk
 	m.fetchSlots = make(chan struct{}, max(1, m.concurrency))
+	m.parserSlots = make(chan struct{}, max(1, sdk.Options.ChunkParserConcurrency))
+	m.processorHash = common.Hash(string(chunkDiscovererBinary))
+	if _, err := sdk.Database.Exec(`CREATE TABLE IF NOT EXISTS chunk_discovery_cache (
+ project TEXT NOT NULL, asset_id INTEGER NOT NULL, cache_key TEXT NOT NULL, candidates TEXT NOT NULL,
+ updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(project,asset_id))`); err != nil {
+		return err
+	}
 	if _, err := sdk.Database.Exec(`CREATE TABLE IF NOT EXISTS chunk_discoveries (
  project TEXT NOT NULL, url TEXT NOT NULL, source_asset_id INTEGER NOT NULL,
  status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -69,17 +81,25 @@ func (m *chunkDiscovererModule) Initialize(sdk *jxscouttypes.ModuleSDK) error {
 		return err
 	}
 	// Resume from saved JavaScript even when no new Burp traffic arrives.
-	var assets []struct {
-		ID int64 `db:"id"`
-	}
-	if err := sdk.Database.SelectContext(sdk.Ctx, &assets, "SELECT id FROM assets WHERE project=? AND content_type='JS' AND fs_path!=''", sdk.Options.ProjectName); err != nil {
-		return err
-	}
-	for _, asset := range assets {
-		if err := sdk.DBEventBus.Publish(sdk.Ctx, sdk.Database, "chunkdiscovery.resume", assetservice.EventAssetSaved{AssetID: asset.ID}); err != nil {
+	var after int64
+	for {
+		var assets []struct {
+			ID int64 `db:"id"`
+		}
+		if err := sdk.Database.SelectContext(sdk.Ctx, &assets, "SELECT id FROM assets WHERE project=? AND content_type='JS' AND fs_path!='' AND id>? ORDER BY id LIMIT 128", sdk.Options.ProjectName, after); err != nil {
 			return err
 		}
+		if len(assets) == 0 {
+			break
+		}
+		for _, asset := range assets {
+			if err := sdk.DBEventBus.Publish(sdk.Ctx, sdk.Database, "chunkdiscovery.resume", assetservice.EventAssetSaved{AssetID: asset.ID}); err != nil {
+				return err
+			}
+			after = asset.ID
+		}
 	}
+
 	return nil
 }
 
@@ -121,18 +141,12 @@ func (m *chunkDiscovererModule) handleAssetSavedEvent(ctx context.Context, asset
 }
 
 func (s *chunkDiscovererModule) discoverPossibleChunks(ctx context.Context, asset assetservice.Asset) error {
-	source, err := os.ReadFile(asset.Path)
+	chunksRaw, err := s.extractCandidates(ctx, asset)
 	if err != nil {
 		return dbeventbus.NewRetriableError(err)
 	}
-	key := asset.URL + "\x00" + common.Hash(string(source))
-	if _, duplicate := s.processed.LoadOrStore(key, true); duplicate {
+	if len(chunksRaw) == 0 {
 		return nil
-	}
-	chunksRaw, err := s.execChunkDiscoverer(ctx, asset, source)
-	if err != nil {
-		s.processed.Delete(key)
-		return dbeventbus.NewRetriableError(err)
 	}
 
 	chunks := []string{}
@@ -156,7 +170,7 @@ func (s *chunkDiscovererModule) discoverPossibleChunks(ctx context.Context, asse
 		if common.IsCaptureNoise(chunkURL) {
 			continue
 		}
-		if _, duplicate := s.claimed.LoadOrStore(chunkURL, true); duplicate {
+		if s.claimed.add(chunkURL) {
 			continue
 		}
 		// Previously captured URLs need no additional network request.
@@ -218,26 +232,71 @@ func (s *chunkDiscovererModule) discoverPossibleChunks(ctx context.Context, asse
 	return nil
 }
 
-func (s *chunkDiscovererModule) execChunkDiscoverer(ctx context.Context, asset assetservice.Asset, source []byte) ([]string, error) {
-	var urls []string
-	_ = s.sdk.Database.SelectContext(ctx, &urls, "SELECT url FROM assets WHERE project = ?", s.sdk.Options.ProjectName)
-	seeds, _ := json.Marshal(urls)
-	// Prepare the command to run the JavaScript script with Bun
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "bun", "run", s.chunkDiscovererBinaryPath, "--stdin", fmt.Sprintf("%d", s.sdk.Options.ChunkDiscovererBruteForceLimit), string(seeds))
-
-	cmd.Stdin = bytes.NewReader(source)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("chunk discovery: %w: %s", err, stderr.String())
+func (s *chunkDiscovererModule) extractCandidates(ctx context.Context, asset assetservice.Asset) ([]string, error) {
+	// All event subscriptions share this gate; only the configured number of ASTs
+	// and source streams can be resident, including validation subprocesses.
+	select {
+	case s.parserSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	if strings.TrimSpace(string(output)) == "" {
+	defer func() { <-s.parserSlots }()
+	source, err := os.Open(asset.Path)
+	if err != nil {
+		return nil, err
+	}
+	defer source.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, source); err != nil {
+		return nil, err
+	}
+	inputHash := fmt.Sprintf("%x", digest.Sum(nil))
+	key := asset.URL + "\x00" + inputHash
+	if s.processed.add(key) {
 		return nil, nil
 	}
-	return strings.Split(strings.TrimSpace(string(output)), "\n"), nil
+	var urls []string
+	if err := s.sdk.Database.SelectContext(ctx, &urls, "SELECT url FROM assets WHERE project=? AND content_type='JS' ORDER BY url", s.sdk.Options.ProjectName); err != nil {
+		s.processed.remove(key)
+		return nil, err
+	}
+	seeds, err := json.Marshal(urls)
+	if err != nil {
+		s.processed.remove(key)
+		return nil, err
+	}
+	cacheKey := common.Hash(inputHash + s.processorHash + common.Hash(string(seeds)) + fmt.Sprint(s.sdk.Options.ChunkDiscovererBruteForceLimit))
+	var cached string
+	if err := s.sdk.Database.GetContext(ctx, &cached, "SELECT candidates FROM chunk_discovery_cache WHERE project=? AND asset_id=? AND cache_key=?", s.sdk.Options.ProjectName, asset.ID, cacheKey); err == nil {
+		var candidates []string
+		if json.Unmarshal([]byte(cached), &candidates) == nil {
+			return candidates, nil
+		}
+	}
+	if _, err := source.Seek(0, io.SeekStart); err != nil {
+		s.processed.remove(key)
+		return nil, err
+	}
+	childCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(childCtx, "bun", s.chunkDiscovererBinaryPath, "--stream", fmt.Sprint(s.sdk.Options.ChunkDiscovererBruteForceLimit))
+	cmd.Stdin = io.MultiReader(bytes.NewReader(append(seeds, '\n')), source)
+	stderr := common.NewTailBuffer(8192)
+	cmd.Stderr = stderr
+	output, err := cmd.Output()
+	if err != nil {
+		s.processed.remove(key)
+		return nil, fmt.Errorf("chunk discovery: %w: %.2000s", err, stderr.String())
+	}
+	candidates := []string{}
+	if strings.TrimSpace(string(output)) != "" {
+		candidates = strings.Split(strings.TrimSpace(string(output)), "\n")
+	}
+	encoded, _ := json.Marshal(candidates)
+	if _, err := s.sdk.Database.ExecContext(ctx, `INSERT INTO chunk_discovery_cache(project,asset_id,cache_key,candidates) VALUES(?,?,?,?) ON CONFLICT(project,asset_id) DO UPDATE SET cache_key=excluded.cache_key,candidates=excluded.candidates,updated_at=CURRENT_TIMESTAMP`, s.sdk.Options.ProjectName, asset.ID, cacheKey, string(encoded)); err != nil {
+		s.sdk.Logger.Debug("could not cache chunk candidates", "err", err)
+	}
+	return candidates, nil
 }
 
 func (s *chunkDiscovererModule) recordDiscovery(ctx context.Context, source int64, url, status, detail string) {
@@ -290,12 +349,18 @@ func resolveCandidates(parsedURL *url.URL, sourceURL string, raw []string, allow
 }
 
 func (s *chunkDiscovererModule) validateJavaScript(ctx context.Context, source string) (bool, error) {
+	select {
+	case s.parserSlots <- struct{}{}:
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+	defer func() { <-s.parserSlots }()
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bun", s.chunkDiscovererBinaryPath, "--validate")
 	cmd.Stdin = strings.NewReader(source)
-	var diagnostics bytes.Buffer
-	cmd.Stderr = &diagnostics
+	diagnostics := common.NewTailBuffer(8192)
+	cmd.Stderr = diagnostics
 	output, err := cmd.Output()
 	if err != nil {
 		return false, fmt.Errorf("JavaScript validation: %w: %.1000s", err, diagnostics.String())
